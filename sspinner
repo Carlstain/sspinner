@@ -6,11 +6,13 @@ See CLAUDE.md in this repo for the full design write-up.
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -93,6 +95,21 @@ def dim(text):
     return paint(text, C.DIM)
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Columns that are safe to shrink when a table would otherwise overflow the
+# terminal width, in shrink priority order. 'service' and 'status' are never
+# shrunk - service is the primary identifier and status is the animated cell.
+_SHRINKABLE_COLUMNS = ("detail", "url", "runner")
+_MIN_COLUMN_WIDTH = 6
+
+
+def _visible_len(text):
+    # Width off the plain text only - ANSI escape bytes must never count
+    # toward a column's (or a screen row's) width. See CLAUDE.md styling notes.
+    return len(_ANSI_RE.sub("", text))
+
+
 def render_table(headers, rows):
     # Cells are either a plain string, or a (text, *paint_codes) tuple for a
     # colored cell. Width is always computed off the plain text so painted
@@ -105,13 +122,41 @@ def render_table(headers, rows):
         for i, cell in enumerate(row):
             widths[i] = max(widths[i], len(cell_text(cell)))
 
+    def boxed_width(ws):
+        # "  " indent + "│ " + cells joined by " │ " + " │"
+        return 2 + 2 + sum(ws) + 3 * (len(ws) - 1) + 2
+
+    # Clamp to the terminal's current width: shrink the widest flexible
+    # columns a character at a time (cycling through the priority list so no
+    # single column bottoms out before its neighbors get a turn) until the
+    # whole boxed line fits, or nothing left is shrinkable. This is what
+    # actually fixes the corrupted-redraw bug - see _Frame below for the
+    # other half (counting screen rows, not logical lines).
+    term_width = shutil.get_terminal_size().columns
+    shrink_idx = [headers.index(h) for h in _SHRINKABLE_COLUMNS if h in headers]
+    while shrink_idx and boxed_width(widths) > term_width:
+        shrank_any = False
+        for i in shrink_idx:
+            if widths[i] > _MIN_COLUMN_WIDTH and boxed_width(widths) > term_width:
+                widths[i] -= 1
+                shrank_any = True
+        if not shrank_any:
+            break
+
+    def truncate(text, width):
+        if len(text) <= width:
+            return text
+        if width <= 1:
+            return text[:width]
+        return text[: width - 1] + "…"
+
     def hline(left, mid, right):
         return left + mid.join("─" * (w + 2) for w in widths) + right
 
     def render_row(cells, header=False):
         parts = []
         for i, cell in enumerate(cells):
-            padded = f"{cell_text(cell):<{widths[i]}}"
+            padded = f"{truncate(cell_text(cell), widths[i]):<{widths[i]}}"
             if header:
                 parts.append(paint(padded, C.BOLD, C.CYAN))
             elif isinstance(cell, tuple):
@@ -252,19 +297,29 @@ def _fit_segments(segments, width=None):
 
 
 class _Frame:
-    # Tracks how many lines the widget's previous draw used, so the next
-    # draw can move the cursor back up over exactly that many lines
+    # Tracks how many SCREEN ROWS the widget's previous draw used, so the
+    # next draw can move the cursor back up over exactly that many rows
     # (\x1b[<n>A + \r) and erase everything below (\x1b[J) before reprinting,
-    # rather than scrolling the screen on every keystroke.
+    # rather than scrolling the screen on every keystroke. This must be
+    # screen rows, not logical lines: a line wider than the terminal wraps to
+    # more than one row, and moving up by line-count instead of row-count is
+    # exactly what made a wide StatusTable scroll forever on an 80-column
+    # terminal instead of redrawing in place - see render_table()'s width
+    # clamp for the other half of that fix. Width is re-read on every render
+    # since a terminal can be resized mid-boot.
     def __init__(self):
         self.count = 0
+
+    def _rows_for(self, lines):
+        columns = shutil.get_terminal_size().columns
+        return sum(max(1, math.ceil(_visible_len(line) / columns)) for line in lines)
 
     def render(self, lines):
         if self.count:
             sys.stdout.write(f"\x1b[{self.count}A\r\x1b[J")
         sys.stdout.write("\n".join(lines) + "\n")
         sys.stdout.flush()
-        self.count = len(lines)
+        self.count = self._rows_for(lines)
 
     def collapse(self, summary_line):
         # The signature "finished" move: erase the whole region and leave a
@@ -679,6 +734,25 @@ def is_port_open(port, host="localhost"):
         return False
 
 
+def wait_for_port_free(port, timeout=5, tick=None):
+    # The teardown-side twin of wait_for_port(): polls until the port stops
+    # answering, or the timeout elapses. Used by teardown_project() so a
+    # service is only ever reported '○ stopped' once its port has actually
+    # been released, not just because 'docker compose down' or a SIGTERM
+    # returned.
+    start = time.time()
+    deadline = start + timeout
+    frame_i = 0
+    while time.time() < deadline:
+        if not is_port_open(port, host="localhost"):
+            return True
+        if tick is not None:
+            tick(_SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)], time.time() - start)
+            frame_i += 1
+        time.sleep(0.25)
+    return not is_port_open(port, host="localhost")
+
+
 def compose_has_containers(compose_project):
     r = subprocess.run(
         ["docker", "compose", "-p", compose_project, "ps", "-q"],
@@ -696,36 +770,46 @@ def service_running(svc):
     return None  # unknown - no port and not docker-compose
 
 
-def build_pane_command(svc):
+def build_pane_command(svc, pidfile=None):
+    # pidfile, if given, is prefixed as `echo $$ > "<pidfile>"; ` - the one
+    # mechanism shared by every backend (Terminator, the terminal-emulator
+    # backend, and the sequential fallback) for `stop` to later find and kill
+    # the pane's process group. $$ survives the trailing `exec bash` (same
+    # pid takes over the shell), so the file stays valid for the pane's life.
     path = svc["path"]
     runner = svc["runner"]
     if runner == "docker-compose":
         build = "--build" if svc.get("build", True) else ""
         project = svc["compose_project"]
-        return (
+        cmd = (
             f'cd "{path}" && docker compose -p "{project}" up -d {build} '
             f'&& docker compose -p "{project}" logs -f --tail 100; exec bash'
         )
-    if runner in ("yarn", "pnpm"):
+    elif runner in ("yarn", "pnpm"):
         script = svc.get("script", "dev")
-        return f'cd "{path}" && {runner} {script}; exec bash'
-    if runner == "npm":
+        cmd = f'cd "{path}" && {runner} {script}; exec bash'
+    elif runner == "npm":
         script = svc.get("script", "dev")
-        return f'cd "{path}" && npm run {script}; exec bash'
-    if runner == "poetry":
-        return f'cd "{path}" && poetry run {svc["command"]}; exec bash'
-    if runner == "custom":
-        return f'cd "{path}" && {svc["command"]}; exec bash'
-    raise ValueError(f"unknown runner {runner!r}")
+        cmd = f'cd "{path}" && npm run {script}; exec bash'
+    elif runner == "poetry":
+        cmd = f'cd "{path}" && poetry run {svc["command"]}; exec bash'
+    elif runner == "custom":
+        cmd = f'cd "{path}" && {svc["command"]}; exec bash'
+    else:
+        raise ValueError(f"unknown runner {runner!r}")
+    if pidfile is not None:
+        cmd = f'echo $$ > "{pidfile}"; {cmd}'
+    return cmd
 
 
 class StatusTable:
     # Owns the single dynamic service/runner/detail/url/status table that
     # cmd_run renders once and updates in place as the boot progresses
     # (replaces the old three-tables-plus-per-service-headings flow - see
-    # CLAUDE.md's "run control flow"). Backends (run_terminator/run_tmux)
-    # never print their own headings or ok()/err() lines for a service's
-    # progress on a tty; they just call set_status()/set_context() here and
+    # CLAUDE.md's "run control flow"). Backends (run_terminator/
+    # run_terminal_windows) never print their own headings or ok()/err()
+    # lines for a service's progress on a tty; they just call
+    # set_status()/set_context() here and
     # cmd_run owns when/whether that actually redraws (animate=True on a
     # real tty via _Frame, or left as a silent state update otherwise so the
     # non-tty path can print the table exactly twice - once up front, once
@@ -806,14 +890,174 @@ def ensure_network(name):
         subprocess.run(["docker", "network", "create", name], check=True)
 
 
-def tmux_session_name(project):
-    return f"sspinner-{project}"
+RUN_STATE_DIR = Path.home() / ".config" / "sspinner" / "running"
+# Pid tracking, one file per service (running/<project>/<service>.pid). This
+# is what lets `stop` kill non-docker services now that there's no tmux
+# session whose death took every pane process down with it - see
+# CLAUDE.md's "run control flow" and "stop" sections. State, not code: same
+# rule as the registry, never checked into this repo.
 
 
-def tmux_has_session(session):
-    return subprocess.run(
-        ["tmux", "has-session", "-t", session], capture_output=True
-    ).returncode == 0
+def _project_state_dir(project):
+    return RUN_STATE_DIR / project
+
+
+def _pidfile_path(project, svc_name):
+    return _project_state_dir(project) / f"{svc_name}.pid"
+
+
+def clear_run_state(project):
+    shutil.rmtree(_project_state_dir(project), ignore_errors=True)
+
+
+def _read_pid(pidfile):
+    try:
+        return int(pidfile.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_belongs_to(pid, path):
+    # Cheap guard against pid reuse: confirm the process this pid points to
+    # still looks like the one sspinner started, by checking its cmdline
+    # mentions the service's own directory.
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    return path.encode() in cmdline
+
+
+def kill_tracked_process(project, svc_name, svc_path, tick=None):
+    # Verify-then-escalate: SIGTERM the process group, give it a few seconds,
+    # SIGKILL if it's still around. Returns True if something was actually
+    # killed (or was already gone), False if the pidfile was stale/missing.
+    # tick(spinner, elapsed), if given, is called on the same ~0.25s cadence
+    # wait_for_port() uses, so callers can animate a status cell while this
+    # blocks - see StopTable's per-service spinner in teardown_project().
+    pidfile = _pidfile_path(project, svc_name)
+    pid = _read_pid(pidfile)
+    if pid is None:
+        return False
+    if not _pid_belongs_to(pid, svc_path):
+        pidfile.unlink(missing_ok=True)
+        return False
+
+    def alive():
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def wait_while_alive(seconds, start):
+        frame_i = 0
+        deadline = time.time() + seconds
+        while alive() and time.time() < deadline:
+            if tick is not None:
+                tick(_SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)], time.time() - start)
+                frame_i += 1
+            time.sleep(0.25)
+
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        pidfile.unlink(missing_ok=True)
+        return True  # already gone
+
+    start = time.time()
+    wait_while_alive(5, start)
+    if alive():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+        wait_while_alive(2, start)
+    pidfile.unlink(missing_ok=True)
+    return True
+
+
+def _identify_port_holder(port):
+    # Best-effort: who's answering on this port, so a "still in use" message
+    # can name a pid instead of just failing silently. Degrades to None (a
+    # plain "couldn't identify" note) if ss/lsof are missing or give nothing -
+    # never treated as fatal, this is purely informational.
+    try:
+        r = subprocess.run(
+            ["ss", "-ltnp", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        match = re.search(r'\(\("([^"]+)",pid=(\d+)', r.stdout)
+        if match:
+            return f"{match.group(1)} (pid {match.group(2)})"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        r = subprocess.run(
+            ["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=3,
+        )
+        pids = r.stdout.split()
+        if pids:
+            return f"pid {pids[0]}"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+# ------------------------------------------------------------ terminal apps
+# Emulator resolution for the windowed backend that replaces tmux when
+# Terminator isn't on $PATH: $TERMINAL, then the system default
+# (x-terminal-emulator), then a probe list of common emulators. Each knows
+# how to open a titled window that runs one shell command.
+_TERMINAL_PROBE_LIST = (
+    "gnome-terminal", "konsole", "xfce4-terminal", "kitty", "alacritty",
+    "wezterm", "xterm",
+)
+
+
+def _terminal_argv(binary_name, binary_path, title, cmd):
+    if binary_name == "gnome-terminal":
+        return [binary_path, "--title", title, "--", "bash", "-c", cmd]
+    if binary_name == "konsole":
+        return [binary_path, "-p", f"tabtitle={title}", "-e", "bash", "-c", cmd]
+    if binary_name == "xfce4-terminal":
+        return [binary_path, "--title", title, "--command", f"bash -c {shlex.quote(cmd)}"]
+    if binary_name == "kitty":
+        return [binary_path, "--title", title, "bash", "-c", cmd]
+    if binary_name == "wezterm":
+        return [binary_path, "start", "--", "bash", "-c", cmd]
+    if binary_name in ("alacritty", "xterm"):
+        title_flag = "-T" if binary_name == "xterm" else "--title"
+        return [binary_path, title_flag, title, "-e", "bash", "-c", cmd]
+    # Unrecognised emulator (e.g. an unknown x-terminal-emulator alternative):
+    # the conventional `<term> -e <shell> -c <cmd>` form covers most of them.
+    return [binary_path, "-e", "bash", "-c", cmd]
+
+
+def resolve_terminal():
+    # Returns (binary_name, binary_path) for the emulator run_windows() will
+    # use, or None if nothing usable was found (caller falls through to
+    # run_fallback()).
+    env_term = os.environ.get("TERMINAL")
+    if env_term:
+        path = shutil.which(env_term)
+        if path:
+            return Path(env_term).name, path
+
+    x_term = shutil.which("x-terminal-emulator")
+    if x_term:
+        # Resolve through the Debian alternatives symlink to a name
+        # _terminal_argv() actually recognises.
+        resolved = Path(os.path.realpath(x_term)).name
+        return resolved, x_term
+
+    for name in _TERMINAL_PROBE_LIST:
+        path = shutil.which(name)
+        if path:
+            return name, path
+
+    return None
 
 
 # ------------------------------------------------------------------- infra
@@ -1106,6 +1350,108 @@ def cmd_names(args):
         print(name)
 
 
+# ------------------------------------------------------------------ exec
+def _find_service(entry, service_name):
+    return next((s for s in entry["services"] if s["name"] == service_name), None)
+
+
+def _compose_containers(svc):
+    # Every container (compose service) defined in a service's own compose
+    # file, via `docker compose config --services` run from that service's
+    # directory - works whether or not the stack is currently up. Returns []
+    # on any error so completion (cmd_containers below) degrades to nothing
+    # rather than spewing.
+    try:
+        r = subprocess.run(
+            ["docker", "compose", "config", "--services"],
+            cwd=svc["path"], capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if r.returncode != 0:
+        return []
+    return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+
+def cmd_docker_services(args):
+    # Hidden completion subcommand: registered docker-compose services of a
+    # project, one per line - what 'exec's 2nd positional completes to.
+    registry = load_registry()
+    entry = registry.get(args.name)
+    if entry is None:
+        return
+    for svc in entry["services"]:
+        if svc["runner"] == "docker-compose":
+            print(svc["name"])
+
+
+def cmd_containers(args):
+    # Hidden completion subcommand: what '-c/--container' completes to.
+    registry = load_registry()
+    entry = registry.get(args.name)
+    if entry is None:
+        return
+    svc = _find_service(entry, args.service)
+    if svc is None or svc["runner"] != "docker-compose":
+        return
+    for container in _compose_containers(svc):
+        print(container)
+
+
+def cmd_exec(project, service_name, container_arg, command):
+    # A shortcut for `docker compose exec` into one of a project's docker
+    # services - saves cd-ing to the repo and remembering the pinned -p
+    # project name. Docker-only by definition; see main()'s manual argv
+    # handling for why this isn't a normal argparse subcommand (the trailing
+    # command needs to pass through untouched, including its own dashes,
+    # which argparse.REMAINDER can't do alongside a same-subparser -c flag).
+    registry = load_registry()
+    entry = registry.get(project)
+    if entry is None:
+        err(f"'{project}' isn't registered. Run 'sspinner list' to see what is.")
+        sys.exit(1)
+    svc = _find_service(entry, service_name)
+    if svc is None:
+        err(f"'{service_name}' isn't a service of '{project}'.")
+        sys.exit(1)
+    if svc["runner"] != "docker-compose":
+        err(f"'{service_name}' isn't a docker-compose service - 'exec' only works on those.")
+        sys.exit(1)
+
+    containers = _compose_containers(svc)
+    container = container_arg or (service_name if service_name in containers else None)
+    if container is None or (containers and container not in containers):
+        if containers:
+            err(f"'{container_arg or service_name}' isn't a container of '{service_name}'. "
+                f"Available: {', '.join(containers)}")
+        else:
+            err(f"couldn't determine '{service_name}''s containers - is its compose file valid?")
+        sys.exit(1)
+
+    project_name = svc["compose_project"]
+    running = subprocess.run(
+        ["docker", "compose", "-p", project_name, "ps", "--status", "running", "-q", container],
+        capture_output=True, text=True,
+    )
+    if not running.stdout.strip():
+        if not sys.stdin.isatty():
+            err(f"'{service_name}' isn't running. Start it with: sspinner run {project}")
+            sys.exit(1)
+        choice = ask_choice(
+            f"'{service_name}' isn't running - what do you want to do?",
+            [f"Run '{project}' now, then exec", "Cancel"],
+        )
+        if choice.startswith("Cancel"):
+            sys.exit(0)
+        cmd_run(argparse.Namespace(name=project, background=False))
+
+    if not command:
+        err("no command given, e.g.: sspinner exec <project> <service> bash")
+        sys.exit(1)
+
+    os.execvp("docker", ["docker", "compose", "-p", project_name, "exec", container, *command])
+
+
 # --------------------------------------------------------------------- run
 def running_projects(registry, exclude=None):
     running = []
@@ -1117,85 +1463,152 @@ def running_projects(registry, exclude=None):
     return running
 
 
+DOWN_TIMEOUT_S = "10"
+
+
 def teardown_project(name, entry):
+    # Returns True if the project came down cleanly (every docker-compose
+    # project actually has no containers left, every non-docker service's
+    # process is actually gone, and every declared port is actually free),
+    # False if anything is still hanging. cmd_stop turns that into the
+    # process exit code; check_other_running (which also calls this, for its
+    # "stop the other project and continue" choice) treats a partial failure
+    # as a warning rather than aborting the run it was trying to get to.
     heading(f"Stopping '{name}'")
-    rows = []
     services = entry["services"]
-    session = tmux_session_name(name)
 
     if not sys.stdout.isatty():
-        # Non-tty keeps the pre-dynamic behavior exactly: static table once,
-        # docker compose's own output streaming straight through, plain ok()
-        # lines. Mirrors cmd_run's animate split.
+        # Non-tty keeps the pre-dynamic behavior's shape: static table once,
+        # subprocess output streaming straight through, plain ok()/err()
+        # lines. Mirrors cmd_run's animate split. Every service (not just
+        # docker-compose ones) is now verified rather than assumed stopped -
+        # see the tty branch below for why.
         rows = []
         for svc in services:
             detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
             rows.append([svc["name"], svc["runner"], detail])
         print(render_table(["service", "runner", "detail"], rows))
+
+        clean = True
         for svc in reversed(services):
+            svc_name = svc["name"]
             if svc["runner"] == "docker-compose":
-                print(f"  stopping {paint(svc['name'], C.BOLD)}...")
-                subprocess.run(["docker", "compose", "-p", svc["compose_project"], "down"])
-        if shutil.which("tmux") and tmux_has_session(session):
-            subprocess.run(["tmux", "kill-session", "-t", session], check=True)
-            ok(f"killed tmux session '{session}'")
-        return
+                project = svc["compose_project"]
+                print(f"  stopping {paint(svc_name, C.BOLD)}...")
+                down_cmd = ["docker", "compose", "-p", project, "down",
+                            "--remove-orphans", "-t", DOWN_TIMEOUT_S]
+                subprocess.run(down_cmd)
+                if compose_has_containers(project):
+                    warn(f"{svc_name}: containers still up, retrying 'down'...")
+                    subprocess.run(down_cmd)
+                if compose_has_containers(project):
+                    err(f"{svc_name}: containers still up after retry")
+                    clean = False
+                else:
+                    # Best-effort: close the leftover pane shell (the
+                    # `logs -f; exec bash` tail) now that the container it
+                    # was following is gone. Never affects the clean verdict.
+                    kill_tracked_process(name, svc_name, svc["path"])
+            else:
+                if kill_tracked_process(name, svc_name, svc["path"]):
+                    ok(f"stopped {svc_name}")
+            if svc.get("port") and (svc["runner"] != "docker-compose" or clean):
+                if wait_for_port_free(svc["port"]):
+                    ok(f"port {svc['port']} for {svc_name} is free")
+                else:
+                    holder = _identify_port_holder(svc["port"])
+                    hint = f" (held by {holder})" if holder else " (couldn't identify what's holding it)"
+                    err(f"port {svc['port']} for {svc_name} is still in use{hint}")
+                    clean = False
+        clear_run_state(name)
+        return clean
 
     # tty: same treatment as the run view - ONE table (StopTable), rendered
-    # once with real service_running() statuses, updated in place. Compose's
-    # own output is captured (Popen+PIPE) rather than streamed: any
-    # subprocess writing to stdout mid-frame would land inside the _Frame
-    # region and corrupt the next redraw, so it's swallowed on success (the
-    # table already says stopped) and printed *after* the frame is finalized
-    # on failure. Docker teardown still runs in REVERSE boot order
-    # (deliberate - dependents come down before their dependencies); the
-    # table's display rows stay in boot order.
+    # once with real service_running() statuses, updated in place. Subprocess
+    # output is captured (Popen+PIPE) rather than streamed: anything writing
+    # to stdout mid-frame would land inside the _Frame region and corrupt the
+    # next redraw, so it's swallowed on success and printed only *after* the
+    # frame is finalized on failure. All services - not just docker-compose
+    # ones - are torn down and then verified in REVERSE boot order (dependents
+    # come down before their dependencies); the table's display rows stay in
+    # boot order.
     table = StopTable(services)
     table.draw()
-    failures = []  # (svc_name, captured compose output)
+    compose_failures = []  # (svc_name, captured compose output)
+    port_failures = []  # (svc_name, port, holder_or_None)
+    clean = True
 
-    compose_services = [s for s in reversed(services) if s["runner"] == "docker-compose"]
-    total = len(compose_services)
-    for i, svc in enumerate(compose_services):
+    reversed_services = list(reversed(services))
+    total = len(reversed_services)
+    for i, svc in enumerate(reversed_services):
         svc_name = svc["name"]
-        proc = subprocess.Popen(
-            ["docker", "compose", "-p", svc["compose_project"], "down"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        start = time.time()
-        frame_i = 0
-        while proc.poll() is None:
-            spinner = _SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)]
-            frame_i += 1
-            elapsed = int(time.time() - start)
-            table.set_status(svc_name, (f"{spinner} stopping ({elapsed}s)", C.YELLOW), animate=False)
-            table.set_context(dim(f"{spinner} stopping {svc_name} ({i + 1}/{total})"), animate=True)
-            time.sleep(0.25)
-        output = proc.stdout.read() if proc.stdout else ""
-        if proc.returncode == 0:
-            table.set_status(svc_name, ("○ stopped", C.DIM), animate=True)
-        else:
-            table.set_status(svc_name, ("✗ error", C.RED), animate=True)
-            failures.append((svc_name, output))
 
-    killed = False
-    if shutil.which("tmux") and tmux_has_session(session):
-        subprocess.run(["tmux", "kill-session", "-t", session], check=True, capture_output=True)
-        killed = True
-    # Non-docker services die with the tmux session's panes (or were never
-    # tracked at all if there's no session) - flip them to stopped either way.
-    for svc in services:
-        if svc["runner"] != "docker-compose":
-            table.set_status(svc["name"], ("○ stopped", C.DIM), animate=False)
-    final_context = dim(f"killed tmux session '{session}'") if killed else None
+        def status_tick(spinner, elapsed, label="stopping"):
+            table.set_status(svc_name, (f"{spinner} {label} ({int(elapsed)}s)", C.YELLOW), animate=False)
+            table.set_context(dim(f"{spinner} {label} {svc_name} ({i + 1}/{total})"), animate=True)
+
+        service_ok = True
+        if svc["runner"] == "docker-compose":
+            project = svc["compose_project"]
+
+            def run_down_attempt():
+                proc = subprocess.Popen(
+                    ["docker", "compose", "-p", project, "down",
+                     "--remove-orphans", "-t", DOWN_TIMEOUT_S],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                )
+                attempt_start = time.time()
+                frame_i = 0
+                while proc.poll() is None:
+                    status_tick(_SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)],
+                                time.time() - attempt_start)
+                    frame_i += 1
+                    time.sleep(0.25)
+                return proc.stdout.read() if proc.stdout else ""
+
+            output = run_down_attempt()
+            if compose_has_containers(project):
+                output += run_down_attempt()
+            if compose_has_containers(project):
+                table.set_status(svc_name, ("✗ still up", C.RED), animate=True)
+                compose_failures.append((svc_name, output))
+                clean = False
+                service_ok = False
+            else:
+                table.set_status(svc_name, ("○ stopped", C.DIM), animate=True)
+                # Best-effort: close the leftover pane shell now that the
+                # container it was following is gone. Doesn't affect status.
+                kill_tracked_process(name, svc_name, svc["path"])
+        else:
+            kill_tracked_process(name, svc_name, svc["path"], tick=status_tick)
+            table.set_status(svc_name, ("○ stopped", C.DIM), animate=True)
+
+        if svc.get("port") and service_ok:
+            def port_tick(spinner, elapsed):
+                status_tick(spinner, elapsed, label="waiting for port")
+            if wait_for_port_free(svc["port"], tick=port_tick):
+                table.set_status(svc_name, ("○ stopped", C.DIM), animate=True)
+            else:
+                holder = _identify_port_holder(svc["port"])
+                table.set_status(svc_name, (f"✗ port {svc['port']} in use", C.RED), animate=True)
+                port_failures.append((svc_name, svc["port"], holder))
+                clean = False
+
+    final_context = dim(f"'{name}' stopped") if clean else None
     table.set_context(final_context, animate=True)
 
     # Only now, with the frame finalized (nothing redraws above this point),
-    # is it safe to print captured compose output for any failures.
-    for svc_name, output in failures:
+    # is it safe to print captured output for any failures.
+    for svc_name, output in compose_failures:
         err(f"docker compose down failed for {svc_name}:")
         if output:
             sys.stdout.write(output if output.endswith("\n") else output + "\n")
+    for svc_name, port, holder in port_failures:
+        hint = f" (held by {holder})" if holder else " (couldn't identify what's holding it)"
+        err(f"port {port} for {svc_name} is still in use{hint}")
+
+    clear_run_state(name)
+    return clean
 
 
 def check_other_running(registry, name):
@@ -1225,25 +1638,30 @@ def check_other_running(registry, name):
         sys.exit(0)
     if choice.startswith("Stop"):
         for o in others:
-            teardown_project(o, registry[o])
+            # A partial teardown failure here (a leftover container/port on
+            # the OTHER project) is worth a warning, but shouldn't abort the
+            # run this prompt exists to get to - only 'sspinner stop' itself
+            # turns "not clean" into a non-zero exit.
+            if not teardown_project(o, registry[o]):
+                warn(f"'{o}' didn't stop cleanly - continuing anyway")
 
 
-def run_tmux(name, entry, table, animate):
-    # Reports progress through `table` (a StatusTable) instead of printing
-    # its own "── Starting X ──" headings / ok()/err() lines - cmd_run owns
-    # the single dynamic table those used to be scattered across. `animate`
-    # mirrors cmd_run's tty check: when False, status changes only update
-    # table's internal state (no redraw), and the ok()/err() lines below are
-    # the non-tty fallback text (see CLAUDE.md).
+def run_terminal_windows(name, entry, table, animate):
+    # The Terminator-less windowed backend: one titled window per service via
+    # resolve_terminal(), opened in boot order with the same port-poll-before-
+    # next-service sequencing run_terminator() uses (there's no multiplexer
+    # session here either, just N independent processes) - reports through
+    # `table` the same way. No tmux-style "session" to query, so "already
+    # running" is the same service_running() snapshot run_terminator() uses.
     services = entry["services"]
-    session = tmux_session_name(name)
-    if tmux_has_session(session):
+    if services and all(service_running(s) for s in services):
         for svc in services:
-            status = ("● running", C.GREEN) if service_running(svc) else ("○ stopped", C.DIM)
-            table.set_status(svc["name"], status, animate=False)
+            table.set_status(svc["name"], ("● running", C.GREEN), animate=False)
         if not animate:
-            ok(f"session '{session}' already running")
+            ok(f"'{name}' looks like it's already running")
         return
+
+    binary_name, binary_path = resolve_terminal()
 
     total = len(services)
     for i, svc in enumerate(services):
@@ -1252,14 +1670,9 @@ def run_tmux(name, entry, table, animate):
         table.set_context(
             dim(f"{_SPINNER_FRAMES[0]} starting {svc_name} ({i + 1}/{total})"), animate=animate
         )
-        cmd = build_pane_command(svc)
-        if i == 0:
-            subprocess.run(
-                ["tmux", "new-session", "-d", "-s", session, "-n", "main", cmd],
-                check=True,
-            )
-        else:
-            subprocess.run(["tmux", "split-window", "-t", session, cmd], check=True)
+        cmd = build_pane_command(svc, pidfile=_pidfile_path(name, svc_name))
+        title = f"sspinner: {name} — {svc_name}"
+        subprocess.Popen(_terminal_argv(binary_name, binary_path, title, cmd))
         if svc.get("port"):
             def tick(spinner, elapsed, svc_name=svc_name, i=i):
                 table.set_status(svc_name, (f"{spinner} starting ({int(elapsed)}s)", C.YELLOW), animate=True)
@@ -1277,7 +1690,6 @@ def run_tmux(name, entry, table, animate):
                     err(f"timed out waiting for {svc_name} on :{svc['port']}")
         else:
             table.set_status(svc_name, ("● started", C.GREEN), animate=animate)
-    subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
 
 
 def _configobj_value(value):
@@ -1289,7 +1701,7 @@ def _configobj_value(value):
     return value
 
 
-def _terminator_layout(services):
+def _terminator_layout(project, services):
     # Grid layout: at most 2 terminals per row, rows stacked top-to-bottom,
     # boot order mapping left-to-right then top-to-bottom. Schema
     # reverse-engineered from the installed terminatorlib source (config.py
@@ -1304,19 +1716,22 @@ def _terminator_layout(services):
     # Shapes this produces: N=1 -> single Terminal. N=2 -> one HPaned(t0,t1).
     # N=3 -> VPaned(HPaned(t0,t1), t2). N=4 -> VPaned(HPaned(t0,t1),
     # HPaned(t2,t3)). N=5 -> VPaned(HPaned(t0,t1), VPaned(HPaned(t2,t3), t4)).
+    def pane_command(svc):
+        return build_pane_command(svc, pidfile=_pidfile_path(project, svc["name"]))
+
     layout = {"window0": {"type": "Window", "parent": ""}}
     n = len(services)
     if n == 1:
         layout["terminal0"] = {
             "type": "Terminal", "parent": "window0", "order": 0,
-            "profile": "default", "command": build_pane_command(services[0]),
+            "profile": "default", "command": pane_command(services[0]),
         }
         return layout
 
     def add_terminal(index, parent, order):
         layout[f"terminal{index}"] = {
             "type": "Terminal", "parent": parent, "order": order,
-            "profile": "default", "command": build_pane_command(services[index]),
+            "profile": "default", "command": pane_command(services[index]),
         }
 
     def build_row(indices, parent, order, row_num):
@@ -1346,7 +1761,7 @@ def _terminator_layout(services):
 
 
 def run_terminator(name, entry, table, animate):
-    # Same table-reporting contract as run_tmux above. Terminator has no
+    # Same table-reporting contract as run_terminal_windows above. Terminator has no
     # per-pane launch step to straddle (the whole layout opens in one Popen
     # call), so the per-service loop below is purely the port-polling
     # sequence - but it still walks services in boot order and marks each
@@ -1360,7 +1775,7 @@ def run_terminator(name, entry, table, animate):
         return
 
     layout_name = f"sspinner-{name}"
-    layout = _terminator_layout(services)
+    layout = _terminator_layout(name, services)
     lines = ["[profiles]", "[[default]]", "[layouts]", f"[[{layout_name}]]"]
     for obj_id, fields in layout.items():
         lines.append(f"[[[{obj_id}]]]")
@@ -1403,25 +1818,36 @@ def run_terminator(name, entry, table, animate):
 
 
 def run_fallback(name, entry, background=False):
-    # background=True (run -b when tmux isn't available either) skips the
-    # exec-last-service-into-the-foreground special case below - every
-    # service gets the same Popen+logfile treatment and control returns to
-    # the shell. Those Popen'd processes are fire-and-forget: sspinner keeps
-    # no pid file, so `stop` can't kill non-docker services started this way
-    # (see CLAUDE.md's "run control flow" for the honest limitation note).
-    warn("neither terminator nor tmux found - running services sequentially, no split panes.")
+    # background=True (run -b, which always uses this backend now - see
+    # cmd_run) skips the exec-last-service-into-the-foreground special case
+    # below - every service gets the same Popen+logfile treatment and
+    # control returns to the shell. Every Popen'd process is still tracked
+    # via a pidfile (start_new_session=True gives it its own process group),
+    # so `stop` can kill it later even though there's no window/session to
+    # tear down for it directly.
+    if background:
+        warn("running in the background - services start sequentially, no split panes.")
+    else:
+        warn("no terminator or terminal emulator found - running services sequentially, no split panes.")
     services = entry["services"]
     for i, svc in enumerate(services):
         is_last = i == len(services) - 1
-        cmd = build_pane_command(svc)
+        pidfile = _pidfile_path(name, svc["name"])
+        cmd = build_pane_command(svc, pidfile=pidfile)
         heading(f"Starting {svc['name']}")
         if not background and is_last and svc["runner"] != "docker-compose":
             print(dim(f"    {cmd}"))
+            # cmd already starts with `echo $$ > "<pidfile>";` (from
+            # build_pane_command) and execvp preserves this process's pid, so
+            # the pidfile is written correctly with no separate step needed.
             os.execvp("bash", ["bash", "-c", cmd])
             return  # unreachable
         log_path = Path(tempfile.gettempdir()) / f"sspinner-{name}-{svc['name']}.log"
         logf = open(log_path, "w")
-        subprocess.Popen(["bash", "-c", cmd], stdout=logf, stderr=subprocess.STDOUT)
+        subprocess.Popen(
+            ["bash", "-c", cmd], stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         print(dim(f"    logging to {log_path}"))
         if svc.get("port"):
             if wait_for_port(svc["port"], label=svc["name"]):
@@ -1448,23 +1874,29 @@ def cmd_run(args):
 
     heading(f"Starting '{args.name}'")
 
-    # -b/--background changes the backend priority: terminator is skipped
-    # entirely (a GUI window is inherently foreground - the whole point of
-    # the flag is to not open one), so it's tmux (detached, no attach at the
-    # end) or the fallback in background mode.
+    clear_run_state(args.name)
+    _project_state_dir(args.name).mkdir(parents=True, exist_ok=True)
+
+    # -b/--background always means the fallback: both windowed backends
+    # (Terminator, and the terminal-emulator backend that replaces tmux) open
+    # a GUI window, which is exactly what -b exists to avoid.
     background = getattr(args, "background", False)
     if background:
-        backend = "tmux" if shutil.which("tmux") else None
+        run_fallback(args.name, entry, background=True)
+        return
+
+    if shutil.which("terminator"):
+        backend = "terminator"
+    elif resolve_terminal() is not None:
+        backend = "terminal"
     else:
-        backend = "terminator" if shutil.which("terminator") else (
-            "tmux" if shutil.which("tmux") else None
-        )
+        backend = None
     if backend is None:
         # run_fallback is deliberately thin (CLAUDE.md) - it keeps its own
         # sequential prints and label-based spinner rather than going
         # through StatusTable, since there are no panes/session for a
         # dynamic table to describe here anyway.
-        run_fallback(args.name, entry, background=background)
+        run_fallback(args.name, entry, background=False)
         return
 
     # ONE table for the whole boot, rendered once up front and then updated
@@ -1480,20 +1912,10 @@ def cmd_run(args):
 
     if backend == "terminator":
         run_terminator(args.name, entry, table, animate)
-    else:
-        run_tmux(args.name, entry, table, animate)
-
-    if backend == "tmux":
-        session = tmux_session_name(args.name)
-        if background:
-            pointer = (
-                f"tmux session: {session} "
-                f"(detached — attach with: tmux attach -t {session})"
-            )
-        else:
-            pointer = f"tmux session: {session}"
-    else:
         pointer = f"terminator window: sspinner: {args.name}"
+    else:
+        run_terminal_windows(args.name, entry, table, animate)
+        pointer = f"terminal windows: sspinner: {args.name}"
 
     if animate:
         table.set_context(dim(pointer), animate=True)
@@ -1501,13 +1923,6 @@ def cmd_run(args):
         table.print_once()
         print(pointer)
     print(dim(f"logs: {DOZZLE_URL}"))
-
-    if backend == "tmux" and not background:
-        session = tmux_session_name(args.name)
-        if sys.stdout.isatty():
-            os.execvp("tmux", ["tmux", "attach", "-t", session])
-        else:
-            print(f"Attach with: tmux attach -t {session}")
 
 
 def cmd_stop(args):
@@ -1517,7 +1932,8 @@ def cmd_stop(args):
         err(f"'{args.name}' isn't registered. Run 'sspinner list' to see what is.")
         sys.exit(1)
 
-    teardown_project(args.name, entry)
+    if not teardown_project(args.name, entry):
+        sys.exit(1)
 
 
 def cmd_down(args):
@@ -1533,8 +1949,9 @@ COMMANDS_HELP = [
     ("register <name>", "interactively define a project's services"),
     ("edit <name>", "open a project's config in $EDITOR"),
     ("list", "show registered projects and live status"),
-    ("run <name> [-b]", "boot a registered project's stack (-b: background, no attach/window)"),
+    ("run <name> [-b]", "boot a registered project's stack (-b: background, no window)"),
     ("stop <name>", "tear down a project's stack"),
+    ("exec <name> <svc> [-c C] <cmd>", "shortcut for 'docker compose exec' into a docker service"),
     ("infra up|down", "manage the shared Dozzle log viewer"),
 ]
 
@@ -1553,7 +1970,8 @@ def print_help():
     examples = (
         "sspinner register myapp",
         "sspinner run myapp",
-        "sspinner run myapp -b   # background: no window, no attach",
+        "sspinner run myapp -b   # background: no window",
+        "sspinner exec myapp back bash",
         "sspinner stop myapp",
         "sspinner list",
     )
@@ -1581,7 +1999,7 @@ def build_parser():
     p.add_argument("name", help="project name")
     p.add_argument(
         "-b", "--background", action="store_true",
-        help="boot detached: no GUI window, no tmux attach (tmux or fallback only)",
+        help="boot detached: no window, output logged to temp files",
     )
     p.set_defaults(func=cmd_run)
 
@@ -1604,12 +2022,61 @@ def build_parser():
     p = sub.add_parser("_names", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_names)
 
+    # Hidden completion helpers for 'exec' - see completions/sspinner.bash
+    # and completions/_sspinner, which depend on their exact output format
+    # (one name per line, nothing else) the same way they already depend on
+    # '_names'. 'exec' itself is NOT wired up here - see main()'s comment on
+    # why it's parsed by hand instead of through argparse.
+    p = sub.add_parser("_docker_services", help=argparse.SUPPRESS)
+    p.add_argument("name")
+    p.set_defaults(func=cmd_docker_services)
+
+    p = sub.add_parser("_containers", help=argparse.SUPPRESS)
+    p.add_argument("name")
+    p.add_argument("service")
+    p.set_defaults(func=cmd_containers)
+
     return parser
+
+
+def _run_exec(argv):
+    # 'exec' is parsed by hand rather than through build_parser(): the
+    # trailing command must pass through completely untouched, including its
+    # own dashes (`bash -c "..."`, `psql -U postgres`), and argparse.REMAINDER
+    # can't do that alongside a same-subparser -c/--container flag - REMAINDER
+    # swallows everything from the point it activates, options included,
+    # rather than letting an earlier -c route to that flag. See CLAUDE.md's
+    # 'exec' section for the full rationale.
+    #
+    # -c/--container is only recognised in the fixed slot right after
+    # <service> - never by scanning the whole argv, since the command being
+    # exec'd routinely has its own -c (`bash -c ...`, `sh -c ...`) that must
+    # not be mistaken for sspinner's own flag.
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: sspinner exec <project> <service> [-c/--container NAME] <command>...")
+        return
+    args = list(argv)
+    if len(args) < 2:
+        err("usage: sspinner exec <project> <service> [-c CONTAINER] <command>...")
+        sys.exit(2)
+    project, service_name = args[0], args[1]
+    rest = args[2:]
+    container = None
+    if rest and rest[0] in ("-c", "--container"):
+        if len(rest) < 2:
+            err(f"{rest[0]} needs a value")
+            sys.exit(2)
+        container = rest[1]
+        rest = rest[2:]
+    cmd_exec(project, service_name, container, rest)
 
 
 def main():
     if len(sys.argv) == 1 or sys.argv[1] in ("-h", "--help"):
         print_help()
+        return
+    if sys.argv[1] == "exec":
+        _run_exec(sys.argv[2:])
         return
     args = build_parser().parse_args()
     args.func(args)

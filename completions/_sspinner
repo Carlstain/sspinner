@@ -10,6 +10,7 @@ _sspinner() {
         'run:boot a registered project'"'"'s stack'
         'stop:tear down a registered project'"'"'s stack'
         'down:deprecated alias for stop'
+        'exec:shortcut for docker compose exec into a project'"'"'s docker service'
         'infra:manage the shared Dozzle log viewer'
     )
 
@@ -24,6 +25,28 @@ _sspinner() {
                 local -a names
                 names=(${(f)"$(sspinner _names 2>/dev/null)"})
                 _describe 'project' names
+            fi
+            ;;
+        exec)
+            # exec <project> <service> [-c/--container CONTAINER] <command>...
+            # - only <project>, <service> and the container flag/value
+            # complete; <command> is arbitrary and can't be.
+            if (( CURRENT == 3 )); then
+                local -a names
+                names=(${(f)"$(sspinner _names 2>/dev/null)"})
+                _describe 'project' names
+            elif (( CURRENT == 4 )); then
+                local -a services
+                services=(${(f)"$(sspinner _docker_services ${words[3]} 2>/dev/null)"})
+                _describe 'service' services
+            elif (( CURRENT == 5 )); then
+                local -a flags
+                flags=('-c' '--container')
+                _describe 'flag' flags
+            elif (( CURRENT == 6 )) && { [[ ${words[5]} == "-c" ]] || [[ ${words[5]} == "--container" ]]; }; then
+                local -a containers
+                containers=(${(f)"$(sspinner _containers ${words[3]} ${words[4]} 2>/dev/null)"})
+                _describe 'container' containers
             fi
             ;;
         infra)
