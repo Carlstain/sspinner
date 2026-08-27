@@ -82,12 +82,29 @@ fi
 
 if command -v terminator >/dev/null 2>&1; then
   echo "  [x] terminator found (preferred for 'sspinner run' - real split panes in its own window)"
-elif command -v tmux >/dev/null 2>&1; then
-  echo "  [x] tmux found ('sspinner run' will use it - install terminator for nicer split panes)"
 else
-  echo "  [ ] neither terminator nor tmux found - 'sspinner run' will fall back to sequential mode (no split panes)"
-  echo "      recommended: sudo apt install terminator"
-  echo "      or at least: sudo apt install tmux"
+  # Mirrors resolve_terminal()'s priority in the sspinner script itself:
+  # $TERMINAL, then the system default (x-terminal-emulator), then a probe
+  # list of common emulators.
+  detected_terminal=""
+  if [ -n "${TERMINAL:-}" ] && command -v "$TERMINAL" >/dev/null 2>&1; then
+    detected_terminal="$TERMINAL"
+  elif command -v x-terminal-emulator >/dev/null 2>&1; then
+    detected_terminal="x-terminal-emulator"
+  else
+    for candidate in gnome-terminal konsole xfce4-terminal kitty alacritty wezterm xterm; do
+      if command -v "$candidate" >/dev/null 2>&1; then
+        detected_terminal="$candidate"
+        break
+      fi
+    done
+  fi
+  if [ -n "$detected_terminal" ]; then
+    echo "  [x] $detected_terminal found ('sspinner run' will open one window per service - install terminator for a nicer single-window grid)"
+  else
+    echo "  [ ] no terminal emulator found - 'sspinner run' will fall back to sequential mode (no split panes)"
+    echo "      recommended: sudo apt install terminator"
+  fi
 fi
 
 echo
