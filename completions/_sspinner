@@ -5,12 +5,16 @@ _sspinner() {
     local -a commands
     commands=(
         'register:interactively define a project'"'"'s services'
-        'edit:open a project'"'"'s config in $EDITOR'
+        'edit:edit a project'"'"'s services'
         'list:show registered projects and live status'
+        'status:show one project'"'"'s status'
         'run:boot a registered project'"'"'s stack'
+        'restart:tear down then boot a project, optionally scoped'
         'stop:tear down a registered project'"'"'s stack'
         'down:deprecated alias for stop'
+        'logs:tail one service'"'"'s logs, or point at the Dozzle viewer'
         'exec:shortcut for docker compose exec into a project'"'"'s docker service'
+        'doctor:read-only preflight for a project (or every project)'
         'infra:manage the shared Dozzle log viewer'
     )
 
@@ -20,11 +24,22 @@ _sspinner() {
     fi
 
     case ${words[2]} in
-        register|edit|run|stop|down)
+        register|edit|run|stop|down|status|doctor)
             if (( CURRENT == 3 )); then
                 local -a names
                 names=(${(f)"$(sspinner _names 2>/dev/null)"})
                 _describe 'project' names
+            fi
+            ;;
+        restart|logs)
+            if (( CURRENT == 3 )); then
+                local -a names
+                names=(${(f)"$(sspinner _names 2>/dev/null)"})
+                _describe 'project' names
+            elif (( CURRENT >= 4 )); then
+                local -a services
+                services=(${(f)"$(sspinner _services ${words[3]} 2>/dev/null)"})
+                _describe 'service' services
             fi
             ;;
         exec)
