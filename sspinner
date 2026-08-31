@@ -5,6 +5,7 @@ See CLAUDE.md in this repo for the full design write-up.
 """
 import argparse
 import contextlib
+import difflib
 import json
 import math
 import os
@@ -69,14 +70,22 @@ def paint(text, *codes):
     return "".join(codes) + text + C.RESET
 
 
+def _heading_line(text, width=60):
+    # The plain text-returning half of heading() (no print, no leading
+    # blank) - reused by cmd_list()'s two-column layout to build a heading
+    # sized to one column's width instead of the usual ~60, so it can be
+    # zipped line-by-line against a second project's block.
+    prefix_plain = f"── {text} "
+    rule = "─" * max(4, width - len(prefix_plain))
+    return paint(f"── {text}", C.BOLD, C.CYAN) + " " + dim(rule)
+
+
 def heading(text):
     # Lightweight section rule, not a box - boxes are reserved for
     # render_table(). Width of the trailing rule is computed off the plain
     # text first (CLAUDE.md styling rule), so it always lands at ~60 cols
     # regardless of how the title is colorized.
-    prefix_plain = f"── {text} "
-    rule = "─" * max(4, 60 - len(prefix_plain))
-    print("\n" + paint(f"── {text}", C.BOLD, C.CYAN) + " " + dim(rule))
+    print("\n" + _heading_line(text))
 
 
 def ok(text):
@@ -95,7 +104,26 @@ def dim(text):
     return paint(text, C.DIM)
 
 
+class Link:
+    # Marker for a render_table()/paint()ed cell that should be an OSC 8
+    # hyperlink to `url` - e.g. ("http://localhost:8080", Link("http://localhost:8080"))
+    # or combined with a color: (text, C.GREEN, Link(url)). Applied around
+    # the cell's already-padded plain text, same discipline paint() already
+    # follows for SGR color codes: wrap after width/truncation, never before.
+    __slots__ = ("url",)
+
+    def __init__(self, url):
+        self.url = url
+
+
+def hyperlink(text, url):
+    if not _color_ok():
+        return text
+    return f"\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\"
+
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_OSC8_RE = re.compile(r"\x1b\]8;;[^\x1b]*\x1b\\")
 
 # Columns that are safe to shrink when a table would otherwise overflow the
 # terminal width, in shrink priority order. 'service' and 'status' are never
@@ -105,15 +133,20 @@ _MIN_COLUMN_WIDTH = 6
 
 
 def _visible_len(text):
-    # Width off the plain text only - ANSI escape bytes must never count
-    # toward a column's (or a screen row's) width. See CLAUDE.md styling notes.
-    return len(_ANSI_RE.sub("", text))
+    # Width off the plain text only - ANSI escape bytes (color AND OSC 8
+    # hyperlink wrappers) must never count toward a column's (or a screen
+    # row's) width. See CLAUDE.md styling notes.
+    return len(_ANSI_RE.sub("", _OSC8_RE.sub("", text)))
 
 
-def render_table(headers, rows):
+def render_table(headers, rows, max_width=None):
     # Cells are either a plain string, or a (text, *paint_codes) tuple for a
     # colored cell. Width is always computed off the plain text so painted
     # ANSI codes never throw off column alignment (see CLAUDE.md styling notes).
+    # max_width overrides the live terminal width - used by cmd_list()'s
+    # two-column layout to clamp each project's table to half the terminal
+    # instead of the whole thing; every other call site leaves it None and
+    # gets today's shutil.get_terminal_size() behavior unchanged.
     def cell_text(cell):
         return cell[0] if isinstance(cell, tuple) else cell
 
@@ -132,7 +165,7 @@ def render_table(headers, rows):
     # whole boxed line fits, or nothing left is shrinkable. This is what
     # actually fixes the corrupted-redraw bug - see _Frame below for the
     # other half (counting screen rows, not logical lines).
-    term_width = shutil.get_terminal_size().columns
+    term_width = max_width if max_width is not None else shutil.get_terminal_size().columns
     shrink_idx = [headers.index(h) for h in _SHRINKABLE_COLUMNS if h in headers]
     while shrink_idx and boxed_width(widths) > term_width:
         shrank_any = False
@@ -160,7 +193,12 @@ def render_table(headers, rows):
             if header:
                 parts.append(paint(padded, C.BOLD, C.CYAN))
             elif isinstance(cell, tuple):
-                parts.append(paint(padded, *cell[1:]))
+                # A Link marker (see 'class Link' above) is applied after
+                # color, not passed to paint() - it isn't an SGR code.
+                link = next((c for c in cell[1:] if isinstance(c, Link)), None)
+                codes = [c for c in cell[1:] if not isinstance(c, Link)]
+                text = paint(padded, *codes) if codes else padded
+                parts.append(hyperlink(text, link.url) if link else text)
             else:
                 parts.append(padded)
         return "│ " + " │ ".join(parts) + " │"
@@ -353,7 +391,7 @@ def ask(prompt, default=None, required=False, allow_back=False):
     width = shutil.get_terminal_size().columns
     hint = f" (default: {default})" if default is not None else ""
     question_line = _fit_segments(
-        [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), (hint, (C.DIM,))], width
+        [("◆ ", (C.BLUE,)), (prompt, (C.BOLD,)), (hint, (C.DIM,))], width
     )
     frame = _Frame()
     error_line = None
@@ -395,7 +433,7 @@ def _ask_with_back(prompt, default=None, required=False):
     with _raw_mode(hide_cursor=False):
         while True:
             question_line = _fit_segments(
-                [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), (hint, (C.DIM,)), (back_hint, (C.DIM,))],
+                [("◆ ", (C.BLUE,)), (prompt, (C.BOLD,)), (hint, (C.DIM,)), (back_hint, (C.DIM,))],
                 width,
             )
             input_line = _fit_segments([("  ", None), (buffer, None)], width)
@@ -469,11 +507,11 @@ def ask_yes_no(prompt, default=True, allow_back=False):
 
     def render_line():
         if selected:
-            yes, no = ("❯ Yes", (C.BOLD, C.CYAN)), ("  No", (C.DIM,))
+            yes, no = ("❯ Yes", (C.BOLD, C.BLUE)), ("  No", (C.DIM,))
         else:
-            yes, no = ("  Yes", (C.DIM,)), ("❯ No", (C.BOLD, C.CYAN))
+            yes, no = ("  Yes", (C.DIM,)), ("❯ No", (C.BOLD, C.BLUE))
         return _fit_segments(
-            [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), ("   ", None), yes, ("    ", None), no,
+            [("◆ ", (C.BLUE,)), (prompt, (C.BOLD,)), ("   ", None), yes, ("    ", None), no,
              (back_hint, (C.DIM,))],
             width,
         )
@@ -515,7 +553,7 @@ def ask_choice(prompt, options, allow_back=False):
     width = shutil.get_terminal_size().columns
     back_hint = " (esc to go back)" if allow_back else ""
     question_line = _fit_segments(
-        [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), (back_hint, (C.DIM,))], width
+        [("◆ ", (C.BLUE,)), (prompt, (C.BOLD,)), (back_hint, (C.DIM,))], width
     )
     selected = 0
     frame = _Frame()
@@ -524,7 +562,7 @@ def ask_choice(prompt, options, allow_back=False):
             lines = [question_line]
             for i, opt in enumerate(options):
                 if i == selected:
-                    lines.append(_fit_segments([("  ❯ ", (C.CYAN,)), (opt, (C.BOLD,))], width))
+                    lines.append(_fit_segments([("  ❯ ", (C.BLUE,)), (opt, (C.BOLD,))], width))
                 else:
                     lines.append(_fit_segments([(f"    {opt}", (C.DIM,))], width))
             frame.render(lines)
@@ -605,7 +643,7 @@ def ask_path(prompt, default=None):
 
             lines = [
                 _fit_segments(
-                    [("◆ ", (C.CYAN,)), (f"{prompt} ", (C.BOLD,)), (buffer, None)], width
+                    [("◆ ", (C.BLUE,)), (f"{prompt} ", (C.BOLD,)), (buffer, None)], width
                 )
             ]
             if error:
@@ -614,7 +652,7 @@ def ask_path(prompt, default=None):
             for i, suggestion in enumerate(suggestions[:8]):
                 text = f"    {suggestion}/"
                 if i == highlighted:
-                    lines.append(_fit_segments([(text, (C.CYAN, C.REVERSE))], width))
+                    lines.append(_fit_segments([(text, (C.BLUE, C.REVERSE))], width))
                 else:
                     lines.append(_fit_segments([(text, (C.DIM,))], width))
             lines.append(_fit_segments(
@@ -660,27 +698,46 @@ def ask_path(prompt, default=None):
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
-def wait_for_port(port, timeout=120, host="localhost", label=None, tick=None):
+def wait_for_port(port, timeout=120, host="localhost", label=None, tick=None,
+                   rcfile=None, allow_skip=False):
+    # Returns one of "up" / "timeout" / "exited" / "skipped" / "aborted" -
+    # richer than the old True/False, so a caller can tell a genuine timeout
+    # apart from the service's own command dying, or the user backing out.
     # label=None (or a non-tty stdout) keeps this exactly as silent/plain as
     # before - callers print their own ok()/err() line once this returns.
     # When a label is given on a real terminal, animate a one-line spinner in
     # place (redrawn with \r\x1b[K) so waiting doesn't look like a hang; the
     # line is cleared before returning either way so the caller's line lands
-    # clean. tick=None keeps this whole path byte-for-byte as it was before
-    # tick existed.
+    # clean. tick=None keeps this whole path's original connect-attempt
+    # timing unchanged from before tick/rcfile/allow_skip existed.
+    #
+    # rcfile, if given, is build_pane_command()'s '<pidfile>.rc' sibling -
+    # its appearance means the service's own command has already exited
+    # (successfully or not), so there's no point waiting out the rest of
+    # `timeout` for a port that's never going to open. Checked on the same
+    # cadence as the connect attempts in both branches below.
     animate = label is not None and sys.stdout.isatty()
     deadline = time.time() + timeout
     start = time.time()
     frame_i = 0
 
+    def exited():
+        return rcfile is not None and rcfile.exists()
+
+    def clear_line():
+        if animate:
+            sys.stdout.write("\r\x1b[K")
+            sys.stdout.flush()
+
     if tick is None:
         while time.time() < deadline:
+            if exited():
+                clear_line()
+                return "exited"
             try:
                 with socket.create_connection((host, port), timeout=2):
-                    if animate:
-                        sys.stdout.write("\r\x1b[K")
-                        sys.stdout.flush()
-                    return True
+                    clear_line()
+                    return "up"
             except OSError:
                 if animate:
                     elapsed = int(time.time() - start)
@@ -690,39 +747,71 @@ def wait_for_port(port, timeout=120, host="localhost", label=None, tick=None):
                     sys.stdout.write("\r\x1b[K" + paint(text, C.DIM))
                     sys.stdout.flush()
                 time.sleep(1)
-        if animate:
-            sys.stdout.write("\r\x1b[K")
-            sys.stdout.flush()
-        return False
+        clear_line()
+        return "timeout"
 
     # tick given: a caller (StatusTable's per-service spinner cell) wants
     # smooth ~4/s updates even though the actual TCP connect attempts still
     # only retry ~once/s - so the connect itself is throttled by
-    # next_attempt while the outer loop wakes every ~0.25s to call tick().
+    # next_attempt while the outer loop wakes every ~0.25s to call tick(),
+    # check the exit marker, and (if allow_skip) poll for an 's'/'q'
+    # keypress. allow_skip puts stdin in cbreak mode for the duration of
+    # this call (via _raw_mode(), the same primitive the registration
+    # widgets use) so a single keypress is seen without Enter; Ctrl-C still
+    # works since cbreak leaves signal processing alone.
+    key_ctx = (
+        _raw_mode(hide_cursor=False)
+        if allow_skip and sys.stdin.isatty()
+        else contextlib.nullcontext()
+    )
     next_attempt = start
+    with key_ctx:
+        while time.time() < deadline:
+            if allow_skip and sys.stdin.isatty() and select.select([sys.stdin], [], [], 0)[0]:
+                key = _read_one(sys.stdin.fileno())
+                if key in ("s", "S"):
+                    clear_line()
+                    return "skipped"
+                if key in ("q", "Q"):
+                    clear_line()
+                    return "aborted"
+            if exited():
+                clear_line()
+                return "exited"
+            now = time.time()
+            if now >= next_attempt:
+                try:
+                    with socket.create_connection((host, port), timeout=2):
+                        clear_line()
+                        return "up"
+                except OSError:
+                    next_attempt = time.time() + 1
+            elapsed = time.time() - start
+            spinner = _SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)]
+            frame_i += 1
+            tick(spinner, elapsed)
+            if animate:
+                text = f"{spinner} waiting for {label} on :{port} ({int(elapsed)}s)"
+                sys.stdout.write("\r\x1b[K" + paint(text, C.DIM))
+                sys.stdout.flush()
+            time.sleep(0.25)
+    clear_line()
+    return "timeout"
+
+
+def _check_early_exit(rcfile, seconds=2):
+    # Best-effort fail-fast for a service with no port to poll: give its
+    # command a couple of seconds to prove it's still alive before reporting
+    # 'started' - catches an instantly-failing command (typo'd binary, bad
+    # script name) without turning a fire-and-forget no-port service into
+    # something run blocks on indefinitely.
+    if rcfile is None:
+        return False
+    deadline = time.time() + seconds
     while time.time() < deadline:
-        now = time.time()
-        if now >= next_attempt:
-            try:
-                with socket.create_connection((host, port), timeout=2):
-                    if animate:
-                        sys.stdout.write("\r\x1b[K")
-                        sys.stdout.flush()
-                    return True
-            except OSError:
-                next_attempt = time.time() + 1
-        elapsed = time.time() - start
-        spinner = _SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)]
-        frame_i += 1
-        tick(spinner, elapsed)
-        if animate:
-            text = f"{spinner} waiting for {label} on :{port} ({int(elapsed)}s)"
-            sys.stdout.write("\r\x1b[K" + paint(text, C.DIM))
-            sys.stdout.flush()
+        if rcfile.exists():
+            return True
         time.sleep(0.25)
-    if animate:
-        sys.stdout.write("\r\x1b[K")
-        sys.stdout.flush()
     return False
 
 
@@ -761,13 +850,87 @@ def compose_has_containers(compose_project):
     return bool(r.stdout.strip())
 
 
-def service_running(svc):
+_running_compose_projects_cache = None
+
+
+def _running_compose_projects():
+    # Every docker-compose project currently running, from one `docker ps`
+    # call - cached per process. 'list' used to shell out to
+    # compose_has_containers() once per docker-compose service; this
+    # collapses that to one call regardless of how many projects/services
+    # are registered. compose_has_containers() stays as its own thing for
+    # teardown_project()'s verify-and-escalate loop, which needs a fresh
+    # single-project read after each 'down' attempt, not a cached snapshot.
+    global _running_compose_projects_cache
+    if _running_compose_projects_cache is None:
+        r = subprocess.run(
+            ["docker", "ps", "--format", '{{.Label "com.docker.compose.project"}}'],
+            capture_output=True, text=True,
+        )
+        _running_compose_projects_cache = {
+            line.strip() for line in r.stdout.splitlines() if line.strip()
+        }
+    return _running_compose_projects_cache
+
+
+def _service_state(svc, project=None):
+    # Single source of truth for "what is this service actually doing right
+    # now" - service_running() and _status_cell() below are both thin views
+    # over this. Order of evidence matters: for a docker-compose service,
+    # compose-project membership is checked FIRST and is authoritative. A
+    # port number is not unique across registered projects (this machine's
+    # 'lawial' and 'dayeaty' both declare :8080 for keycloak) - checking the
+    # port first would paint a stopped project 'running' whenever a
+    # same-numbered port happens to be answering for someone else.
+    # 'project' is the sspinner project name (not svc['compose_project']),
+    # needed to look up this service's own tracked pidfile; omit it and the
+    # non-docker branches degrade to their old, less specific answers.
+    if svc["runner"] == "docker-compose":
+        if svc["compose_project"] not in _running_compose_projects():
+            return "stopped"
+        port = svc.get("port")
+        if port and not is_port_open(port):
+            return "starting"
+        return "running"
+
+    pid = _read_pid(_pidfile_path(project, svc["name"])) if project else None
+    tracked_alive = pid is not None and _pid_belongs_to(pid, svc["path"]) and _pid_alive(pid)
     port = svc.get("port")
     if port:
-        return is_port_open(port)
-    if svc["runner"] == "docker-compose":
-        return compose_has_containers(svc["compose_project"])
-    return None  # unknown - no port and not docker-compose
+        if not is_port_open(port):
+            return "stopped"
+        if pid is not None and not tracked_alive:
+            return "foreign"  # port answers, but our own tracked process is dead
+        return "running"
+    return "running" if tracked_alive else "unknown"
+
+
+def _tracked_pid_alive(project, svc):
+    pid = _read_pid(_pidfile_path(project, svc["name"]))
+    return pid is not None and _pid_belongs_to(pid, svc["path"]) and _pid_alive(pid)
+
+
+def service_running(svc, project=None):
+    # True/False/None view of _service_state(), for call sites that only
+    # need a boolean (skip-relaunch checks, running_projects()). 'starting'
+    # counts as running for these purposes - a compose project mid-boot
+    # still means "don't try to start this again".
+    state = _service_state(svc, project)
+    if state in ("running", "starting"):
+        return True
+    if state == "stopped":
+        return False
+    return None  # foreign or unknown - genuinely ambiguous
+
+
+def _status_cell(svc, project=None):
+    return {
+        "running": ("● running", C.GREEN),
+        "starting": ("◐ starting", C.YELLOW),
+        "stopped": ("○ stopped", C.DIM),
+        "foreign": ("◑ foreign", C.YELLOW),
+        "unknown": ("○ unknown", C.DIM),
+    }[_service_state(svc, project)]
 
 
 def build_pane_command(svc, pidfile=None):
@@ -776,30 +939,154 @@ def build_pane_command(svc, pidfile=None):
     # backend, and the sequential fallback) for `stop` to later find and kill
     # the pane's process group. $$ survives the trailing `exec bash` (same
     # pid takes over the shell), so the file stays valid for the pane's life.
+    # A pidfile also gets a '.rc' sibling written right after the service's
+    # own command exits (`echo $? > "<pidfile>.rc"`) - that's what
+    # wait_for_port()'s rcfile param polls for to detect a service dying
+    # almost instantly, instead of waiting out the full port timeout.
     path = svc["path"]
     runner = svc["runner"]
     if runner == "docker-compose":
         build = "--build" if svc.get("build", True) else ""
         project = svc["compose_project"]
-        cmd = (
+        inner = (
             f'cd "{path}" && docker compose -p "{project}" up -d {build} '
-            f'&& docker compose -p "{project}" logs -f --tail 100; exec bash'
+            f'&& docker compose -p "{project}" logs -f --tail 100'
         )
     elif runner in ("yarn", "pnpm"):
         script = svc.get("script", "dev")
-        cmd = f'cd "{path}" && {runner} {script}; exec bash'
+        inner = f'cd "{path}" && {runner} {script}'
     elif runner == "npm":
         script = svc.get("script", "dev")
-        cmd = f'cd "{path}" && npm run {script}; exec bash'
+        inner = f'cd "{path}" && npm run {script}'
     elif runner == "poetry":
-        cmd = f'cd "{path}" && poetry run {svc["command"]}; exec bash'
+        inner = f'cd "{path}" && poetry run {svc["command"]}'
     elif runner == "custom":
-        cmd = f'cd "{path}" && {svc["command"]}; exec bash'
+        inner = f'cd "{path}" && {svc["command"]}'
     else:
         raise ValueError(f"unknown runner {runner!r}")
     if pidfile is not None:
-        cmd = f'echo $$ > "{pidfile}"; {cmd}'
-    return cmd
+        return f'echo $$ > "{pidfile}"; {inner}; echo $? > "{pidfile}.rc"; exec bash'
+    return f'{inner}; exec bash'
+
+
+class _BootAborted(Exception):
+    # Raised by _poll_service_boot() when the user presses 'q' during a
+    # wait, caught by run_terminal_windows()/run_terminator() to stop
+    # walking the rest of the boot order.
+    pass
+
+
+def _read_rc(rcfile):
+    try:
+        return int(rcfile.read_text().strip())
+    except (OSError, ValueError):
+        return "?"
+
+
+def _preflight_port(project, svc, table, animate):
+    # Checked right before this service's own command is launched - only
+    # meaningful for a backend that launches sequentially. run_terminator's
+    # whole grid launches in one Popen call before its per-service loop even
+    # starts, so it can't offer this; see run_terminator()'s own comment. A
+    # foreign holder is reported, never killed - same rule teardown already
+    # follows for a port that's still open after 'down'.
+    #
+    # Deliberately stricter than service_running()/_service_state(): those
+    # degrade to "assume it's ours" when there's no pidfile to check (fine
+    # for a read-only status display), but a pre-launch gate needs the
+    # opposite default - no positive evidence of a live tracked process
+    # means don't assume it's safe to skip past.
+    port = svc.get("port")
+    if not port or not is_port_open(port):
+        return True
+    ours = (
+        svc["compose_project"] in _running_compose_projects()
+        if svc["runner"] == "docker-compose"
+        else _tracked_pid_alive(project, svc)
+    )
+    if ours:
+        return True
+    holder = _identify_port_holder(port)
+    hint = f" (held by {holder})" if holder else " (couldn't identify what's holding it)"
+    table.set_status(svc["name"], (f"✗ port {port} busy", C.RED), animate=animate)
+    if not animate:
+        err(f"port {port} for {svc['name']} is already in use{hint} - not starting it")
+    return False
+
+
+def _poll_service_boot(project, svc, table, animate, i, total):
+    # Shared 'mark starting, wait, report the outcome' step for
+    # run_terminal_windows() and run_terminator() - the only difference
+    # between the two backends is how the pane/window gets launched before
+    # this runs. Raises _BootAborted if the user presses 'q' during the wait.
+    svc_name = svc["name"]
+    port = svc.get("port")
+    table.set_status(svc_name, (f"{_SPINNER_FRAMES[0]} starting (0s)", C.YELLOW), animate=animate)
+    table.set_context(
+        dim(f"{_SPINNER_FRAMES[0]} starting {svc_name} ({i + 1}/{total}) · s skip · q abort"),
+        animate=animate,
+    )
+    rcfile = _rcfile_path(project, svc_name)
+
+    if not port:
+        if _check_early_exit(rcfile):
+            code = _read_rc(rcfile)
+            table.set_status(svc_name, (f"✗ exited ({code})", C.RED), animate=animate)
+            if not animate:
+                err(f"{svc_name} exited ({code}) before it could start")
+        else:
+            table.set_status(svc_name, ("● started", C.GREEN), animate=animate)
+        return
+
+    def tick(spinner, elapsed, svc_name=svc_name, i=i):
+        table.set_status(svc_name, (f"{spinner} starting ({int(elapsed)}s)", C.YELLOW), animate=True)
+        table.set_context(
+            dim(f"{spinner} starting {svc_name} ({i + 1}/{total}) · s skip · q abort"), animate=True
+        )
+
+    boot_start = time.time()
+    outcome = wait_for_port(port, tick=tick if animate else None, rcfile=rcfile, allow_skip=animate)
+    elapsed = time.time() - boot_start
+    if outcome == "up":
+        table.set_status(svc_name, (f"● running {elapsed:.1f}s", C.GREEN), animate=animate)
+        table.durations[svc_name] = elapsed
+        if not animate:
+            ok(f"{svc_name} is up on :{port} ({elapsed:.1f}s)")
+    elif outcome == "exited":
+        code = _read_rc(rcfile)
+        table.set_status(svc_name, (f"✗ exited ({code})", C.RED), animate=animate)
+        if not animate:
+            err(f"{svc_name} exited ({code}) before it came up on :{port}")
+    elif outcome == "skipped":
+        table.set_status(svc_name, ("⊘ skipped", C.DIM), animate=animate)
+    elif outcome == "aborted":
+        table.set_status(svc_name, ("⊘ skipped", C.DIM), animate=animate)
+        raise _BootAborted()
+    else:  # "timeout"
+        table.set_status(svc_name, ("✗ timeout", C.RED), animate=animate)
+        if not animate:
+            err(f"timed out waiting for {svc_name} on :{port}")
+
+
+_DURATION_BAR_WIDTH = 24
+_DURATION_BAR_CHAR = "▇"
+
+
+def _render_duration_bars(durations):
+    # A relative-duration bar per service that actually finished booting, in
+    # boot order - the elapsed times _poll_service_boot() already computes
+    # for its '● running <N.Ns>' status cells, kept on the table instead of
+    # thrown away once painted. Needs at least two data points to be
+    # "relative" to anything; a single service (or none) prints nothing.
+    if len(durations) < 2:
+        return
+    max_elapsed = max(durations.values())
+    name_width = max(len(name) for name in durations)
+    print(dim("\n  boot time"))
+    for name, elapsed in durations.items():
+        filled = max(1, round((elapsed / max_elapsed) * _DURATION_BAR_WIDTH)) if max_elapsed > 0 else 0
+        bar = paint(_DURATION_BAR_CHAR * filled, C.BLUE)
+        print(f"  {name:<{name_width}}  {bar}  {elapsed:.1f}s")
 
 
 class StatusTable:
@@ -816,11 +1103,28 @@ class StatusTable:
     # at the end - per CLAUDE.md).
     HEADERS = ["service", "runner", "detail", "url", "status"]
 
-    def __init__(self, services):
+    def __init__(self, services, project=None):
         self.services = services
+        self.project = project
         self.statuses = {svc["name"]: ("○ queued", C.DIM) for svc in services}
         self.context = None
         self.frame = _Frame()
+        # Boot durations for services that actually came up, in boot order -
+        # kept around (not thrown away after painting the '● running <N.Ns>'
+        # cell) so a post-boot summary can show them. See
+        # _render_duration_bars().
+        self.durations = {}
+
+    def _name_cell(self, svc):
+        # Bold the service name while its status cell is actively ticking (a
+        # spinner-frame prefix, shared by 'starting' and 'stopping' cells
+        # alike) - with several rows the eye finds the one actually moving
+        # without hunting through otherwise identical-looking queued/stopped
+        # rows for the spinner. Shared by StatusTable and StopTable's _row().
+        status_text = self.statuses[svc["name"]][0]
+        if status_text and status_text[0] in _SPINNER_FRAMES:
+            return (svc["name"], C.BOLD)
+        return svc["name"]
 
     def _row(self, svc):
         # One row per service; subclasses override this (plus HEADERS) for a
@@ -828,7 +1132,7 @@ class StatusTable:
         # never duplicated (see StopTable).
         detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
         url = f"http://localhost:{svc['port']}" if svc.get("port") else "-"
-        return [svc["name"], svc["runner"], detail, url, self.statuses[svc["name"]]]
+        return [self._name_cell(svc), svc["runner"], detail, url, self.statuses[svc["name"]]]
 
     def _rows(self):
         return [self._row(svc) for svc in self.services]
@@ -863,24 +1167,18 @@ class StatusTable:
 class StopTable(StatusTable):
     # teardown_project's variant of the run view: no url column (meaningless
     # while tearing down), and initial statuses reflect each service's real
-    # service_running() state instead of "queued". Everything else -
+    # _status_cell() state instead of "queued". Everything else -
     # _Frame redraw, context line, set_status/set_context - is inherited.
     HEADERS = ["service", "runner", "detail", "status"]
 
-    def __init__(self, services):
-        super().__init__(services)
+    def __init__(self, services, project):
+        super().__init__(services, project=project)
         for svc in services:
-            running = service_running(svc)
-            if running is True:
-                self.statuses[svc["name"]] = ("● running", C.GREEN)
-            elif running is False:
-                self.statuses[svc["name"]] = ("○ stopped", C.DIM)
-            else:
-                self.statuses[svc["name"]] = ("○ unknown", C.DIM)
+            self.statuses[svc["name"]] = _status_cell(svc, project=project)
 
     def _row(self, svc):
         detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
-        return [svc["name"], svc["runner"], detail, self.statuses[svc["name"]]]
+        return [self._name_cell(svc), svc["runner"], detail, self.statuses[svc["name"]]]
 
 
 def ensure_network(name):
@@ -906,8 +1204,27 @@ def _pidfile_path(project, svc_name):
     return _project_state_dir(project) / f"{svc_name}.pid"
 
 
+def _rcfile_path(project, svc_name):
+    # build_pane_command()'s '.rc' sibling of the pidfile - see its comment
+    # for what writes it and wait_for_port()'s rcfile param for what reads it.
+    return Path(f"{_pidfile_path(project, svc_name)}.rc")
+
+
 def clear_run_state(project):
     shutil.rmtree(_project_state_dir(project), ignore_errors=True)
+
+
+def _clear_service_state(project, service_names):
+    # Scoped twin of clear_run_state(): removes just the pidfile (+ '.rc'
+    # sibling) for the given services, rather than the whole project run
+    # directory - used by 'run --only/--except' and 'restart' so pidfiles
+    # for services outside the current scope (which might still be tracked
+    # as running from an earlier full run) aren't destroyed out from under a
+    # later 'stop'. A full unscoped 'run' still uses clear_run_state() above,
+    # since 'stop' expects the whole run directory gone afterward.
+    for svc_name in service_names:
+        _pidfile_path(project, svc_name).unlink(missing_ok=True)
+        _rcfile_path(project, svc_name).unlink(missing_ok=True)
 
 
 def _read_pid(pidfile):
@@ -928,6 +1245,14 @@ def _pid_belongs_to(pid, path):
     return path.encode() in cmdline
 
 
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def kill_tracked_process(project, svc_name, svc_path, tick=None):
     # Verify-then-escalate: SIGTERM the process group, give it a few seconds,
     # SIGKILL if it's still around. Returns True if something was actually
@@ -943,17 +1268,10 @@ def kill_tracked_process(project, svc_name, svc_path, tick=None):
         pidfile.unlink(missing_ok=True)
         return False
 
-    def alive():
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-
     def wait_while_alive(seconds, start):
         frame_i = 0
         deadline = time.time() + seconds
-        while alive() and time.time() < deadline:
+        while _pid_alive(pid) and time.time() < deadline:
             if tick is not None:
                 tick(_SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)], time.time() - start)
                 frame_i += 1
@@ -968,7 +1286,7 @@ def kill_tracked_process(project, svc_name, svc_path, tick=None):
 
     start = time.time()
     wait_while_alive(5, start)
-    if alive():
+    if _pid_alive(pid):
         try:
             os.killpg(pgid, signal.SIGKILL)
         except OSError:
@@ -1262,6 +1580,30 @@ def cmd_register(args):
             services = existing.get("services", [])
             network = existing.get("network")
 
+    from_name = getattr(args, "from_project", None)
+    if from_name and not services:
+        source = registry.get(from_name)
+        if source is None:
+            err(f"'{from_name}' isn't registered - nothing to clone from.")
+            sys.exit(1)
+        heading(f"Cloning '{from_name}' -> '{args.name}'")
+        network = source.get("network")
+        for src_svc in source["services"]:
+            svc = dict(src_svc)
+            print(dim(f"  {svc['name']} ({svc['runner']}) - confirm its path and port"))
+            svc["path"] = ask_path(f"path for '{svc['name']}'", default=svc.get("path"))
+            svc["port"] = ask_optional_int(
+                f"port for '{svc['name']}' (blank = none)", default=svc.get("port")
+            )
+            if svc["runner"] == "docker-compose":
+                svc["compose_project"] = ask(
+                    "compose project name (-p)",
+                    default=f"{slugify(args.name)}-{svc['name']}", required=True,
+                )
+            services.append(svc)
+        heading("Cloned services")
+        print_service_summary(services)
+
     if network is None:
         network = ask(
             "shared docker network these services need (blank if none)", default=""
@@ -1286,6 +1628,9 @@ def cmd_register(args):
 
     heading(f"Final config for '{args.name}'")
     print_service_summary(services)
+    problems = _validate_entry({"network": network, "services": services})
+    for p in problems:
+        warn(p)
     if not ask_yes_no("Save this configuration?", default=True):
         warn("not saved")
         return
@@ -1295,12 +1640,58 @@ def cmd_register(args):
     ok(f"saved '{args.name}' ({len(services)} service(s)) -> {REGISTRY_PATH}")
 
 
-def cmd_edit(args):
-    registry = load_registry()
-    entry = registry.get(args.name)
-    if entry is None:
-        err(f"'{args.name}' isn't registered. Run 'sspinner list' to see what is.")
-        sys.exit(1)
+def _validate_entry(entry):
+    # Returns a list of human-readable problems, empty if none. Mirrors the
+    # fields configure_runner() itself requires per runner, so a hand-edited
+    # (or badly cloned) entry is caught here instead of surfacing later as a
+    # raw ValueError out of build_pane_command().
+    problems = []
+    services = entry.get("services")
+    if not isinstance(services, list) or not services:
+        return ["'services' must be a non-empty list"]
+
+    seen_names = set()
+    seen_ports = set()
+    for i, svc in enumerate(services):
+        name = svc.get("name")
+        label = name or f"service #{i + 1}"
+        if not name:
+            problems.append(f"service #{i + 1}: missing 'name'")
+        elif name in seen_names:
+            problems.append(f"duplicate service name '{name}'")
+        else:
+            seen_names.add(name)
+
+        runner = svc.get("runner")
+        if runner not in RUNNERS:
+            problems.append(f"{label}: unknown runner {runner!r} (must be one of {', '.join(RUNNERS)})")
+        elif runner == "docker-compose" and not svc.get("compose_project"):
+            problems.append(f"{label}: docker-compose services need 'compose_project'")
+        elif runner in ("yarn", "pnpm", "npm") and not svc.get("script"):
+            problems.append(f"{label}: '{runner}' services need a 'script'")
+        elif runner in ("poetry", "custom") and not svc.get("command"):
+            problems.append(f"{label}: '{runner}' services need a 'command'")
+
+        path = svc.get("path")
+        if not path or not str(path).startswith("/"):
+            problems.append(f"{label}: 'path' must be an absolute path")
+
+        port = svc.get("port")
+        if port is not None:
+            if not isinstance(port, int):
+                problems.append(f"{label}: 'port' must be an integer or null")
+            elif port in seen_ports:
+                problems.append(f"{label}: port {port} is already used by another service in this project")
+            else:
+                seen_ports.add(port)
+    return problems
+
+
+def _edit_raw_entry(entry):
+    # Opens `entry` as JSON in $EDITOR and returns the parsed, validated
+    # result, or None if the user's edit was invalid/discarded - the caller
+    # decides what "discarded" means (cmd_edit's non-tty path exits
+    # non-zero; its interactive menu just drops back to the menu).
     editor = shlex.split(os.environ.get("EDITOR", "nano"))
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
         json.dump(entry, tf, indent=2)
@@ -1311,36 +1702,208 @@ def cmd_edit(args):
         try:
             new_entry = json.loads(Path(tmp_path).read_text())
         except json.JSONDecodeError as e:
-            err(f"invalid JSON, not saved: {e}")
-            sys.exit(1)
-        registry[args.name] = new_entry
-        save_registry(registry)
-        ok(f"saved changes to '{args.name}'")
+            err(f"invalid JSON, discarded: {e}")
+            return None
+        problems = _validate_entry(new_entry)
+        if problems:
+            err("problems found, discarded:")
+            for p in problems:
+                err(f"  {p}")
+            return None
+        return new_entry
     finally:
         os.unlink(tmp_path)
+
+
+def cmd_edit(args):
+    registry = load_registry()
+    entry = _require_project(registry, args.name)
+
+    if not _interactive():
+        # Same shape as before this command grew an interactive front door:
+        # straight to $EDITOR on the raw JSON, now validated on the way back.
+        edited = _edit_raw_entry(entry)
+        if edited is None:
+            sys.exit(1)
+        registry[args.name] = edited
+        save_registry(registry)
+        ok(f"saved changes to '{args.name}'")
+        return
+
+    services = list(entry.get("services", []))
+    network = entry.get("network")
+    while True:
+        heading(f"Editing '{args.name}'")
+        print_service_summary(services)
+        choice = ask_choice("what do you want to do?", [
+            "Add a service",
+            "Remove a service",
+            "Reorder services",
+            "Change shared network",
+            "Open raw JSON in $EDITOR",
+            "Save and exit",
+            "Cancel (discard changes)",
+        ])
+        if choice == "Add a service":
+            existing_names = {s["name"] for s in services}
+            services.append(register_one_service(slugify(args.name), existing_names))
+        elif choice == "Remove a service":
+            if not services:
+                warn("nothing to remove")
+                continue
+            target = ask_choice("remove which service?", [s["name"] for s in services])
+            services = [s for s in services if s["name"] != target]
+        elif choice == "Reorder services":
+            if len(services) > 1:
+                services = _reorder_services(services)
+            else:
+                warn("nothing to reorder")
+        elif choice == "Change shared network":
+            network = ask(
+                "shared docker network these services need (blank if none)",
+                default=network or "",
+            ) or None
+        elif choice == "Open raw JSON in $EDITOR":
+            edited = _edit_raw_entry({"network": network, "services": services})
+            if edited is not None:
+                network = edited.get("network")
+                services = edited.get("services", [])
+        elif choice == "Save and exit":
+            problems = _validate_entry({"network": network, "services": services})
+            if problems:
+                for p in problems:
+                    warn(p)
+                if not ask_yes_no("save anyway?", default=False):
+                    continue
+            registry[args.name] = {"network": network, "services": services}
+            save_registry(registry)
+            ok(f"saved changes to '{args.name}'")
+            return
+        else:  # Cancel
+            warn("discarded")
+            return
+
+
+def _project_rows(name, entry):
+    # Shared row builder for cmd_list and cmd_status - one project's
+    # services rendered identically in both, rather than two copies of the
+    # same status-cell/detail-column logic drifting apart.
+    rows = []
+    for svc in entry["services"]:
+        status = _status_cell(svc, project=name)
+        extra = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
+        if svc.get("port"):
+            port = (f"localhost:{svc['port']}", Link(f"http://localhost:{svc['port']}"))
+        else:
+            port = "no port"
+        rows.append([svc["name"], svc["runner"], port, extra, status])
+    return rows
+
+
+_LIST_COLUMNS = ["service", "runner", "port", "detail", "status"]
+_LIST_TWO_COLUMN_MIN_WIDTH = 150
+_LIST_COLUMN_GAP = 4
+
+
+def _pad_visible(text, width):
+    # Pad on the *plain* length, same discipline render_table()'s own
+    # padding follows - text can carry ANSI color/OSC 8 codes from paint()/
+    # hyperlink(), and those bytes must never count toward column width.
+    return text + " " * max(0, width - _visible_len(text))
+
+
+def _project_block_lines(name, entry, width):
+    # One project's heading + table, both sized to `width` instead of the
+    # live terminal width, as a list of already-painted lines - the unit
+    # cmd_list()'s two-column layout zips two of side by side.
+    lines = [_heading_line(name, width=width)]
+    lines.extend(render_table(_LIST_COLUMNS, _project_rows(name, entry), max_width=width).split("\n"))
+    return lines
 
 
 def cmd_list(args):
     registry = load_registry()
     if not registry:
-        print("No projects registered yet. Run 'sspinner register <name>'.")
+        heading("No projects registered yet")
+        print("  sspinner boots per-project local dev stacks, each service in")
+        print("  its own visible window, booted in order.")
+        print(f"\n  {paint('sspinner register <name>', C.BOLD, C.BLUE)} to register your first one")
         return
-    for name, entry in sorted(registry.items()):
-        heading(name)
-        rows = []
-        for svc in entry["services"]:
-            running = service_running(svc)
-            if running is True:
-                status = ("● running", C.GREEN)
-            elif running is False:
-                status = ("○ stopped", C.DIM)
-            else:
-                status = ("○ unknown", C.DIM)
-            extra = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
-            port_text = f"localhost:{svc['port']}" if svc.get("port") else "no port"
-            rows.append([svc["name"], svc["runner"], port_text, extra, status])
-        print(render_table(["service", "runner", "port", "detail", "status"], rows))
-    print(dim(f"\n  logs: {DOZZLE_URL}"))
+
+    total_services = sum(len(e["services"]) for e in registry.values())
+    running_count = sum(
+        1 for name, e in registry.items() for svc in e["services"]
+        if service_running(svc, project=name)
+    )
+    print(dim(
+        f"  {len(registry)} project{'s' if len(registry) != 1 else ''} · "
+        f"{running_count} running · "
+        f"{total_services} service{'s' if total_services != 1 else ''}"
+    ))
+    projects = sorted(registry.items())
+    term_width = shutil.get_terminal_size().columns
+    half_width = (term_width - _LIST_COLUMN_GAP) // 2
+    if len(projects) >= 2 and term_width >= _LIST_TWO_COLUMN_MIN_WIDTH:
+        # Wide terminal, more than one project: lay them out two-up instead
+        # of stacking every table vertically regardless of how much
+        # horizontal room is sitting unused. Same render_table() output per
+        # project (clamped to half_width instead of the full terminal) -
+        # only the placement changes.
+        for i in range(0, len(projects), 2):
+            left_name, left_entry = projects[i]
+            right = projects[i + 1] if i + 1 < len(projects) else None
+            print()
+            left_lines = _project_block_lines(left_name, left_entry, half_width)
+            if right is None:
+                for line in left_lines:
+                    print(line)
+                continue
+            right_name, right_entry = right
+            right_lines = _project_block_lines(right_name, right_entry, half_width)
+            for j in range(max(len(left_lines), len(right_lines))):
+                left = left_lines[j] if j < len(left_lines) else ""
+                right_side = right_lines[j] if j < len(right_lines) else ""
+                print(_pad_visible(left, half_width) + " " * _LIST_COLUMN_GAP + right_side)
+    else:
+        for name, entry in projects:
+            heading(name)
+            print(render_table(_LIST_COLUMNS, _project_rows(name, entry)))
+    print(dim("\n  logs: ") + hyperlink(dim(DOZZLE_URL), DOZZLE_URL))
+
+
+def _require_project(registry, name):
+    # Shared "does this project exist" gate for run/stop/edit/status/
+    # restart/logs/exec - suggests the nearest registered name on a typo
+    # instead of just failing, via difflib against the registry's own keys.
+    entry = registry.get(name)
+    if entry is not None:
+        return entry
+    suggestion = difflib.get_close_matches(name, registry.keys(), n=1)
+    if suggestion:
+        err(f"'{name}' isn't registered - did you mean '{suggestion[0]}'?")
+    else:
+        err(f"'{name}' isn't registered. Run 'sspinner list' to see what is.")
+    sys.exit(1)
+
+
+def cmd_status(args):
+    registry = load_registry()
+    entry = _require_project(registry, args.name)
+    if getattr(args, "json", False):
+        services = [
+            {
+                "name": svc["name"],
+                "runner": svc["runner"],
+                "port": svc.get("port"),
+                "state": _service_state(svc, project=args.name),
+            }
+            for svc in entry["services"]
+        ]
+        print(json.dumps({"project": args.name, "services": services}, indent=2))
+        return
+    heading(args.name)
+    print(render_table(["service", "runner", "port", "detail", "status"], _project_rows(args.name, entry)))
+    print(dim("\n  logs: ") + hyperlink(dim(DOZZLE_URL), DOZZLE_URL))
 
 
 def cmd_names(args):
@@ -1385,6 +1948,18 @@ def cmd_docker_services(args):
             print(svc["name"])
 
 
+def cmd_services(args):
+    # Hidden completion subcommand: every registered service of a project
+    # (not just docker-compose ones), one per line - what 'restart'/'logs'/
+    # 'run --only'/'run --except' complete to.
+    registry = load_registry()
+    entry = registry.get(args.name)
+    if entry is None:
+        return
+    for svc in entry["services"]:
+        print(svc["name"])
+
+
 def cmd_containers(args):
     # Hidden completion subcommand: what '-c/--container' completes to.
     registry = load_registry()
@@ -1406,10 +1981,7 @@ def cmd_exec(project, service_name, container_arg, command):
     # command needs to pass through untouched, including its own dashes,
     # which argparse.REMAINDER can't do alongside a same-subparser -c flag).
     registry = load_registry()
-    entry = registry.get(project)
-    if entry is None:
-        err(f"'{project}' isn't registered. Run 'sspinner list' to see what is.")
-        sys.exit(1)
+    entry = _require_project(registry, project)
     svc = _find_service(entry, service_name)
     if svc is None:
         err(f"'{service_name}' isn't a service of '{project}'.")
@@ -1458,7 +2030,7 @@ def running_projects(registry, exclude=None):
     for name, entry in registry.items():
         if name == exclude:
             continue
-        if any(service_running(svc) for svc in entry["services"]):
+        if any(service_running(svc, project=name) for svc in entry["services"]):
             running.append(name)
     return running
 
@@ -1532,7 +2104,7 @@ def teardown_project(name, entry):
     # ones - are torn down and then verified in REVERSE boot order (dependents
     # come down before their dependencies); the table's display rows stay in
     # boot order.
-    table = StopTable(services)
+    table = StopTable(services, name)
     table.draw()
     compose_failures = []  # (svc_name, captured compose output)
     port_failures = []  # (svc_name, port, holder_or_None)
@@ -1619,7 +2191,7 @@ def check_other_running(registry, name):
     heading("Another project looks like it's already running")
     rows = []
     for o in others:
-        live = [s["name"] for s in registry[o]["services"] if service_running(s)]
+        live = [s["name"] for s in registry[o]["services"] if service_running(s, project=o)]
         status = (", ".join(live), C.GREEN) if live else ("(docker only)", C.DIM)
         rows.append([o, status])
     print(render_table(["project", "running services"], rows))
@@ -1654,9 +2226,9 @@ def run_terminal_windows(name, entry, table, animate):
     # `table` the same way. No tmux-style "session" to query, so "already
     # running" is the same service_running() snapshot run_terminator() uses.
     services = entry["services"]
-    if services and all(service_running(s) for s in services):
+    if services and all(service_running(s, project=name) for s in services):
         for svc in services:
-            table.set_status(svc["name"], ("● running", C.GREEN), animate=False)
+            table.set_status(svc["name"], ("◒ already up", C.GREEN), animate=False)
         if not animate:
             ok(f"'{name}' looks like it's already running")
         return
@@ -1664,32 +2236,21 @@ def run_terminal_windows(name, entry, table, animate):
     binary_name, binary_path = resolve_terminal()
 
     total = len(services)
-    for i, svc in enumerate(services):
-        svc_name = svc["name"]
-        table.set_status(svc_name, (f"{_SPINNER_FRAMES[0]} starting (0s)", C.YELLOW), animate=animate)
-        table.set_context(
-            dim(f"{_SPINNER_FRAMES[0]} starting {svc_name} ({i + 1}/{total})"), animate=animate
-        )
-        cmd = build_pane_command(svc, pidfile=_pidfile_path(name, svc_name))
-        title = f"sspinner: {name} — {svc_name}"
-        subprocess.Popen(_terminal_argv(binary_name, binary_path, title, cmd))
-        if svc.get("port"):
-            def tick(spinner, elapsed, svc_name=svc_name, i=i):
-                table.set_status(svc_name, (f"{spinner} starting ({int(elapsed)}s)", C.YELLOW), animate=True)
-                table.set_context(
-                    dim(f"{spinner} starting {svc_name} ({i + 1}/{total})"), animate=True
-                )
-            up = wait_for_port(svc["port"], tick=tick if animate else None)
-            if up:
-                table.set_status(svc_name, ("● running", C.GREEN), animate=animate)
-                if not animate:
-                    ok(f"{svc_name} is up on :{svc['port']}")
-            else:
-                table.set_status(svc_name, ("✗ timeout", C.RED), animate=animate)
-                if not animate:
-                    err(f"timed out waiting for {svc_name} on :{svc['port']}")
-        else:
-            table.set_status(svc_name, ("● started", C.GREEN), animate=animate)
+    try:
+        for i, svc in enumerate(services):
+            # Launches strictly sequentially (this Popen only runs once the
+            # previous service's wait, below, returns) - so unlike
+            # run_terminator(), a preflight check here actually runs before
+            # this service's own command has a chance to bind the port.
+            if not _preflight_port(name, svc, table, animate):
+                continue
+            cmd = build_pane_command(svc, pidfile=_pidfile_path(name, svc["name"]))
+            title = f"sspinner: {name} — {svc['name']}"
+            subprocess.Popen(_terminal_argv(binary_name, binary_path, title, cmd))
+            _poll_service_boot(name, svc, table, animate, i, total)
+    except _BootAborted:
+        table.set_context(dim(f"'{name}' boot aborted"), animate=animate)
+        return True
 
 
 def _configobj_value(value):
@@ -1767,9 +2328,9 @@ def run_terminator(name, entry, table, animate):
     # sequence - but it still walks services in boot order and marks each
     # "starting" before polling, so the table reads the same progression.
     services = entry["services"]
-    if services and all(service_running(s) for s in services):
+    if services and all(service_running(s, project=name) for s in services):
         for svc in services:
-            table.set_status(svc["name"], ("● running", C.GREEN), animate=False)
+            table.set_status(svc["name"], ("◒ already up", C.GREEN), animate=False)
         if not animate:
             ok(f"'{name}' looks like it's already running")
         return
@@ -1791,30 +2352,17 @@ def run_terminator(name, entry, table, animate):
         "-T", f"sspinner: {name}",
     ])
 
+    # Every pane's command already started the instant the window opened
+    # above (the whole grid launches in one Popen call, unlike
+    # run_terminal_windows()'s sequential per-window Popen) - so there's no
+    # per-service preflight to offer here, only the shared reporting step.
     total = len(services)
-    for i, svc in enumerate(services):
-        svc_name = svc["name"]
-        table.set_status(svc_name, (f"{_SPINNER_FRAMES[0]} starting (0s)", C.YELLOW), animate=animate)
-        table.set_context(
-            dim(f"{_SPINNER_FRAMES[0]} starting {svc_name} ({i + 1}/{total})"), animate=animate
-        )
-        if svc.get("port"):
-            def tick(spinner, elapsed, svc_name=svc_name, i=i):
-                table.set_status(svc_name, (f"{spinner} starting ({int(elapsed)}s)", C.YELLOW), animate=True)
-                table.set_context(
-                    dim(f"{spinner} starting {svc_name} ({i + 1}/{total})"), animate=True
-                )
-            up = wait_for_port(svc["port"], tick=tick if animate else None)
-            if up:
-                table.set_status(svc_name, ("● running", C.GREEN), animate=animate)
-                if not animate:
-                    ok(f"{svc_name} is up on :{svc['port']}")
-            else:
-                table.set_status(svc_name, ("✗ timeout", C.RED), animate=animate)
-                if not animate:
-                    err(f"timed out waiting for {svc_name} on :{svc['port']}")
-        else:
-            table.set_status(svc_name, ("● started", C.GREEN), animate=animate)
+    try:
+        for i, svc in enumerate(services):
+            _poll_service_boot(name, svc, table, animate, i, total)
+    except _BootAborted:
+        table.set_context(dim(f"'{name}' boot aborted"), animate=animate)
+        return True
 
 
 def run_fallback(name, entry, background=False):
@@ -1850,19 +2398,43 @@ def run_fallback(name, entry, background=False):
         )
         print(dim(f"    logging to {log_path}"))
         if svc.get("port"):
-            if wait_for_port(svc["port"], label=svc["name"]):
-                ok(f"{svc['name']} is up on :{svc['port']}")
+            rcfile = _rcfile_path(name, svc["name"])
+            boot_start = time.time()
+            outcome = wait_for_port(svc["port"], label=svc["name"], rcfile=rcfile)
+            elapsed = time.time() - boot_start
+            if outcome == "up":
+                ok(f"{svc['name']} is up on :{svc['port']} ({elapsed:.1f}s)")
+            elif outcome == "exited":
+                err(f"{svc['name']} exited ({_read_rc(rcfile)}) before it came up on :{svc['port']} - see {log_path}")
             else:
                 err(f"timed out waiting for {svc['name']} on :{svc['port']}")
     print(f"\nAll services started in background. Logs: {DOZZLE_URL}")
 
 
+def _scope_services(entry, only=None, except_names=None):
+    # Returns a shallow copy of entry with its services filtered to the
+    # given names (boot order preserved) - used by 'run --only/--except'
+    # and 'restart <name> [service...]' so a scoped operation reuses
+    # teardown_project()/the run backends unchanged, rather than a second,
+    # weaker path re-implementing their verify-and-escalate or boot-order
+    # logic for a subset.
+    services = entry["services"]
+    known = {s["name"] for s in services}
+    for names in (only, except_names):
+        unknown = [n for n in names or [] if n not in known]
+        if unknown:
+            err(f"unknown service(s): {', '.join(unknown)}")
+            sys.exit(1)
+    if only is not None:
+        services = [s for s in services if s["name"] in only]
+    if except_names:
+        services = [s for s in services if s["name"] not in except_names]
+    return {**entry, "services": services}
+
+
 def cmd_run(args):
     registry = load_registry()
-    entry = registry.get(args.name)
-    if entry is None:
-        err(f"'{args.name}' isn't registered. Run 'sspinner register {args.name}' first.")
-        sys.exit(1)
+    entry = _require_project(registry, args.name)
 
     check_other_running(registry, args.name)
 
@@ -1870,11 +2442,25 @@ def cmd_run(args):
     if entry.get("network"):
         ensure_network(entry["network"])
 
+    only = [n.strip() for n in args.only.split(",")] if getattr(args, "only", None) else None
+    except_names = (
+        [n.strip() for n in args.except_.split(",")] if getattr(args, "except_", None) else None
+    )
+    scoped = bool(only or except_names)
+    if scoped:
+        entry = _scope_services(entry, only=only, except_names=except_names)
+        if not entry["services"]:
+            err("no services left after filtering - nothing to run")
+            sys.exit(1)
+
     services = entry["services"]
 
     heading(f"Starting '{args.name}'")
 
-    clear_run_state(args.name)
+    if scoped:
+        _clear_service_state(args.name, [s["name"] for s in services])
+    else:
+        clear_run_state(args.name)
     _project_state_dir(args.name).mkdir(parents=True, exist_ok=True)
 
     # -b/--background always means the fallback: both windowed backends
@@ -1911,26 +2497,29 @@ def cmd_run(args):
         table.print_once()
 
     if backend == "terminator":
-        run_terminator(args.name, entry, table, animate)
+        aborted = run_terminator(args.name, entry, table, animate)
         pointer = f"terminator window: sspinner: {args.name}"
     else:
-        run_terminal_windows(args.name, entry, table, animate)
+        aborted = run_terminal_windows(args.name, entry, table, animate)
         pointer = f"terminal windows: sspinner: {args.name}"
 
+    if aborted:
+        if not animate:
+            table.print_once()
+        return
+
     if animate:
-        table.set_context(dim(pointer), animate=True)
+        table.set_context(paint(pointer, C.BLUE), animate=True)
     else:
         table.print_once()
-        print(pointer)
-    print(dim(f"logs: {DOZZLE_URL}"))
+        print(paint(pointer, C.BLUE))
+    _render_duration_bars(table.durations)
+    print(dim("logs: ") + hyperlink(dim(DOZZLE_URL), DOZZLE_URL))
 
 
 def cmd_stop(args):
     registry = load_registry()
-    entry = registry.get(args.name)
-    if entry is None:
-        err(f"'{args.name}' isn't registered. Run 'sspinner list' to see what is.")
-        sys.exit(1)
+    entry = _require_project(registry, args.name)
 
     if not teardown_project(args.name, entry):
         sys.exit(1)
@@ -1945,20 +2534,149 @@ def cmd_down(args):
     cmd_stop(args)
 
 
+def cmd_restart(args):
+    # teardown then run, scoped to args.services if given - reuses
+    # teardown_project() and cmd_run() unchanged (via _scope_services(), see
+    # cmd_run) rather than a second, weaker path that reimplements their
+    # verify-and-escalate or boot-order logic for a subset.
+    registry = load_registry()
+    entry = _require_project(registry, args.name)
+    only = args.services or None
+    scoped_entry = _scope_services(entry, only=only) if only else entry
+    if not teardown_project(args.name, scoped_entry):
+        warn("teardown wasn't fully clean - starting anyway")
+    cmd_run(argparse.Namespace(
+        name=args.name, background=False,
+        only=",".join(only) if only else None, except_=None,
+    ))
+
+
+def cmd_logs(args):
+    # docker-compose -> 'docker compose logs -f' on the real container;
+    # non-docker -> tail -f the log file run_fallback() already writes to
+    # (/tmp/sspinner-<project>-<service>.log), currently undiscoverable any
+    # other way. os.execvp so Ctrl-C behaves normally, same rationale as
+    # cmd_exec(). No service given -> just point at the shared Dozzle viewer.
+    registry = load_registry()
+    entry = _require_project(registry, args.name)
+    if args.service is None:
+        print(dim("logs: ") + hyperlink(dim(DOZZLE_URL), DOZZLE_URL))
+        return
+    svc = _find_service(entry, args.service)
+    if svc is None:
+        err(f"'{args.service}' isn't a service of '{args.name}'.")
+        sys.exit(1)
+    if svc["runner"] == "docker-compose":
+        os.execvp("docker", [
+            "docker", "compose", "-p", svc["compose_project"], "logs", "-f", "--tail", "100",
+        ])
+        return  # unreachable
+    log_path = Path(tempfile.gettempdir()) / f"sspinner-{args.name}-{args.service}.log"
+    if not log_path.exists():
+        err(f"no log file at {log_path} - '{args.service}' isn't running via 'run -b' "
+            "or the sequential fallback")
+        sys.exit(1)
+    os.execvp("tail", ["tail", "-f", str(log_path)])
+
+
+_RUNNER_BINARY = {"yarn": "yarn", "pnpm": "pnpm", "npm": "npm", "poetry": "poetry"}
+
+
+def cmd_doctor(args):
+    # Read-only preflight, reports never fixes - same rule teardown follows
+    # for a foreign port holder. Checks things that only bite at boot time:
+    # docker reachability, which 'run' backend would be picked, and per
+    # project per service - the path still exists, a compose file is where
+    # a docker-compose service expects one, the runner binary is on $PATH,
+    # and the declared port is free or already ours.
+    registry = load_registry()
+    names = [args.name] if getattr(args, "name", None) else sorted(registry)
+    if not names:
+        print("No projects registered yet. Run 'sspinner register <name>'.")
+        return
+
+    docker_ok = shutil.which("docker") is not None and subprocess.run(
+        ["docker", "info"], capture_output=True
+    ).returncode == 0
+    backend = (
+        "terminator" if shutil.which("terminator")
+        else "terminal emulator" if resolve_terminal() is not None
+        else "sequential fallback (no windows)"
+    )
+    print(render_table(["check", "result"], [
+        ["docker daemon", ("● reachable", C.GREEN) if docker_ok else ("✗ unreachable", C.RED)],
+        ["'run' backend", backend],
+        ["Dozzle infra", ("● up", C.GREEN) if compose_has_containers(INFRA_PROJECT) else ("○ down", C.DIM)],
+    ]))
+
+    for name in names:
+        entry = registry.get(name)
+        if entry is None:
+            err(f"'{name}' isn't registered.")
+            continue
+        heading(name)
+        rows = []
+        for svc in entry["services"]:
+            path = Path(svc["path"])
+            path_ok = path.is_dir()
+            path_cell = ("● exists", C.GREEN) if path_ok else ("✗ missing", C.RED)
+
+            if svc["runner"] == "docker-compose":
+                has_compose = path_ok and any((path / f).exists() for f in COMPOSE_FILENAMES)
+                runner_cell = (
+                    ("● compose file found", C.GREEN) if has_compose
+                    else ("✗ no compose file", C.RED)
+                )
+            else:
+                binary = _RUNNER_BINARY.get(svc["runner"])
+                if binary is None:
+                    runner_cell = "-"
+                else:
+                    runner_cell = (
+                        ("● on PATH", C.GREEN) if shutil.which(binary)
+                        else (f"✗ '{binary}' not found", C.RED)
+                    )
+
+            port = svc.get("port")
+            if not port:
+                port_cell = "-"
+            elif not is_port_open(port):
+                port_cell = ("○ free", C.DIM)
+            elif service_running(svc, project=name) is True:
+                port_cell = ("● ours", C.GREEN)
+            else:
+                holder = _identify_port_holder(port)
+                port_cell = (f"✗ busy ({holder or 'unknown'})", C.RED)
+
+            rows.append([svc["name"], path_cell, runner_cell, port_cell])
+        print(render_table(["service", "path", "runner", "port"], rows))
+
+
 COMMANDS_HELP = [
     ("register <name>", "interactively define a project's services"),
-    ("edit <name>", "open a project's config in $EDITOR"),
+    ("register <name> --from <src>", "clone an already-registered project's services"),
+    ("edit <name>", "edit a project's services (menu on a tty, $EDITOR otherwise)"),
     ("list", "show registered projects and live status"),
+    ("status <name> [--json]", "show one project's status"),
     ("run <name> [-b]", "boot a registered project's stack (-b: background, no window)"),
+    ("run <name> --only/--except a,b", "boot (or skip) just the named services"),
+    ("restart <name> [svc...]", "tear down then boot, optionally scoped to some services"),
     ("stop <name>", "tear down a project's stack"),
+    ("logs <name> [svc]", "tail one service's logs, or point at the Dozzle viewer"),
     ("exec <name> <svc> [-c C] <cmd>", "shortcut for 'docker compose exec' into a docker service"),
+    ("doctor [name]", "read-only preflight: docker, paths, ports, runner binaries"),
     ("infra up|down", "manage the shared Dozzle log viewer"),
 ]
 
 
 def print_help():
-    print(paint("sspinner", C.BOLD, C.CYAN) +
-          " — global launcher for multi-repo dev stacks")
+    # Reuses heading()'s "compute the rule from the plain text, extend to
+    # ~60 cols" technique for the same visual language as every section rule
+    # below, but the tagline stays dim rather than bold+cyan - a quiet
+    # caption under the wordmark, not a second heading competing with it.
+    print(paint("sspinner", C.BOLD, C.BLUE))
+    tagline = "global launcher for multi-repo dev stacks"
+    print(dim(f"── {tagline} " + "─" * max(4, 60 - len(tagline) - 3)))
     heading("USAGE")
     print("  sspinner <command> [args]")
     heading("COMMANDS")
@@ -1986,14 +2704,23 @@ def build_parser():
 
     p = sub.add_parser("register", help="interactively define a project's services")
     p.add_argument("name", help="project name")
+    p.add_argument(
+        "--from", dest="from_project", metavar="SRC",
+        help="clone an already-registered project's services as a starting point",
+    )
     p.set_defaults(func=cmd_register)
 
-    p = sub.add_parser("edit", help="open a project's config in $EDITOR")
+    p = sub.add_parser("edit", help="edit a project's services (menu on a tty, $EDITOR otherwise)")
     p.add_argument("name", help="project name")
     p.set_defaults(func=cmd_edit)
 
     p = sub.add_parser("list", help="show registered projects and live status")
     p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("status", help="show one project's status")
+    p.add_argument("name", help="project name")
+    p.add_argument("--json", action="store_true", help="emit uncolored JSON instead of a table")
+    p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("run", help="boot a registered project's stack")
     p.add_argument("name", help="project name")
@@ -2001,7 +2728,17 @@ def build_parser():
         "-b", "--background", action="store_true",
         help="boot detached: no window, output logged to temp files",
     )
+    p.add_argument("--only", metavar="A,B", help="boot just these services (comma-separated)")
+    p.add_argument(
+        "--except", dest="except_", metavar="A,B",
+        help="boot every service except these (comma-separated)",
+    )
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("restart", help="tear down then boot a project, optionally scoped")
+    p.add_argument("name", help="project name")
+    p.add_argument("services", nargs="*", help="restart just these services (default: all)")
+    p.set_defaults(func=cmd_restart)
 
     p = sub.add_parser("stop", help="tear down a registered project's stack")
     p.add_argument("name", help="project name")
@@ -2011,6 +2748,15 @@ def build_parser():
     p = sub.add_parser("down", help=argparse.SUPPRESS)
     p.add_argument("name", help="project name")
     p.set_defaults(func=cmd_down)
+
+    p = sub.add_parser("logs", help="tail one service's logs, or point at the Dozzle viewer")
+    p.add_argument("name", help="project name")
+    p.add_argument("service", nargs="?", help="service name (omit to just show the Dozzle URL)")
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("doctor", help="read-only preflight: docker, paths, ports, runner binaries")
+    p.add_argument("name", nargs="?", help="project name (default: every registered project)")
+    p.set_defaults(func=cmd_doctor)
 
     infra = sub.add_parser("infra", help="manage the shared Dozzle log viewer")
     infra_sub = infra.add_subparsers(dest="infra_command", required=True)
@@ -2035,6 +2781,13 @@ def build_parser():
     p.add_argument("name")
     p.add_argument("service")
     p.set_defaults(func=cmd_containers)
+
+    # Hidden completion helper for 'restart'/'logs'/'run --only'/
+    # 'run --except' - every registered service of a project, not just
+    # docker-compose ones (contrast with '_docker_services' above).
+    p = sub.add_parser("_services", help=argparse.SUPPRESS)
+    p.add_argument("name")
+    p.set_defaults(func=cmd_services)
 
     return parser
 
@@ -2078,8 +2831,20 @@ def main():
     if sys.argv[1] == "exec":
         _run_exec(sys.argv[2:])
         return
-    args = build_parser().parse_args()
-    args.func(args)
+    try:
+        args = build_parser().parse_args()
+        args.func(args)
+    except KeyboardInterrupt:
+        print(dim("\ncancelled"))
+        sys.exit(130)
+    except (OSError, subprocess.CalledProcessError, ValueError, KeyError) as e:
+        # Expected-shape failures (a bad runner value that slipped past
+        # _validate_entry from an old registry, a permission error, a
+        # subprocess that exited non-zero) - reported like every other
+        # error in this tool instead of a raw traceback. Anything else
+        # still surfaces as a real traceback, on purpose - it's a bug.
+        err(str(e))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

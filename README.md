@@ -47,21 +47,36 @@ instead.
 ## Commands
 
 ```bash
-sspinner register <project>   # interactive: add services one at a time
-sspinner edit <project>       # open the raw config in $EDITOR
-sspinner list                 # show every registered project + live up/down status
-sspinner run <project>        # boot it: one window per service, in order
-sspinner run <project> -b     # boot it in the background: no window at all
+sspinner register <project>            # interactive: add services one at a time
+sspinner register <project> --from <src>  # clone an existing project's services
+sspinner edit <project>                # menu on a tty, raw $EDITOR otherwise
+sspinner list                          # show every registered project + live status
+sspinner status <project> [--json]     # just one project's status
+sspinner run <project>                 # boot it: one window per service, in order
+sspinner run <project> --only a,b      # boot just these services
+sspinner run <project> --except a      # boot every service except these
+sspinner run <project> -b              # boot it in the background: no window at all
+sspinner restart <project> [svc...]    # tear down then boot, optionally scoped
+sspinner stop <project>                # tear everything down and verify it's actually gone
+sspinner logs <project> [svc]          # tail one service's logs, or the Dozzle URL
 sspinner exec <project> <svc> [-c CONTAINER] <cmd>   # shortcut for docker compose exec
-sspinner stop <project>       # tear everything down and verify it's actually gone
-sspinner infra up / down      # manage the shared Dozzle log viewer directly
+sspinner doctor [project]              # read-only preflight: docker, paths, ports, binaries
+sspinner infra up / down               # manage the shared Dozzle log viewer directly
 ```
 
 (`sspinner down <project>` still works as a deprecated alias for `stop`.)
 
-`sspinner list` shows every registered project with a live status table —
-green `● running` when a service's port answers (or its docker-compose
-project has containers up), dim `○ stopped`/`○ unknown` otherwise:
+`sspinner list` (and `sspinner status <project>`) show a live status table.
+Status cells: green `● running` (port answers, or its docker-compose project
+has containers up) / yellow `◐ starting` (containers up, port not answering
+yet) / dim `○ stopped` / yellow `◑ foreign` (the port answers but it isn't
+this service's own tracked process) — plus, only ever shown mid-boot by
+`run`/`restart`: green `◒ already up` (skipped relaunch, it was already up),
+red `✗ exited (code)` (the command itself died — reported in ~1-2s, not the
+full port timeout), red `✗ timeout`, red `✗ port busy` (something else already
+had the port before boot even started), and dim `⊘ skipped` (you pressed `s`
+during the wait). Above a ~150-column terminal, `list` lays two projects out
+side by side instead of stacking every table vertically:
 
 <p align="center"><img src="images/sspinner-list.png" width="640" alt="sspinner list output showing two demo projects with live status"></p>
 
@@ -120,38 +135,75 @@ you're offered a chance to reorder them (boot order matters) before saving.
 Run it again on an already-registered project to add more services, or start
 over from scratch.
 
+Cloning an existing project's shape (`register <name> --from <src>`) copies
+its services and asks you to confirm each one's path and port (and, for
+docker-compose services, its compose project name) rather than re-answering
+every question from scratch.
+
 ### Editing later
 
-`sspinner edit <project>` opens just that project's config (not the whole
-registry) as JSON in `$EDITOR` and validates it on save. You can also edit
+`sspinner edit <project>` opens a menu on a real terminal — add a service,
+remove one, reorder, change the shared network, drop into raw JSON in
+`$EDITOR`, or cancel — reusing the same widgets `register` uses. Piped/
+non-interactive stdin goes straight to `$EDITOR` on the raw JSON, same as
+before. Either way the result is validated before it's saved (unknown
+runner, a relative path, a missing required field, a duplicate service name
+or port) — a bad edit is refused with the specific problem, not silently
+saved to surface later as a crash. You can also edit
 `~/.config/sspinner/registry.json` directly — it's plain JSON, one entry per
 project.
+
+### `status`, `restart`, `logs`, `doctor`
+
+- `sspinner status <project> [--json]` — just that one project's table
+  (`--json` for scripting).
+- `sspinner restart <project> [service...]` — tears down then boots again,
+  through the exact same teardown/boot code `stop`/`run` use; give it one or
+  more service names to restart just those instead of the whole project.
+- `sspinner logs <project> [service]` — `docker compose logs -f` for a
+  docker-compose service, `tail -f` its log file for anything started via
+  `run -b`/the sequential fallback, or just prints the Dozzle URL if you
+  don't name a service.
+- `sspinner doctor [project]` — read-only preflight, never fixes anything:
+  is docker reachable, which backend would `run` pick, and per project per
+  service — does the path exist, is there a compose file where a
+  docker-compose service expects one, is the runner binary on `$PATH`, is
+  the declared port free or already this service's own.
 
 ## What `run` actually does
 
 0. If another registered project already has something running (checked by
-   port and, for docker-compose services, by whether its compose project has
-   containers up), it shows a table of what's running and asks what to do:
-   stop the other one first, keep it running and start this one too, or
-   cancel. Skipped entirely if nothing else is running, and auto-continues
-   (leaving the other one running) when stdin isn't a terminal.
+   whether its compose project has containers up, for docker-compose
+   services — a port number alone is checked last and never taken as proof,
+   since two unrelated projects can happen to declare the same port), it
+   shows a table of what's running and asks what to do: stop the other one
+   first, keep it running and start this one too, or cancel. Skipped
+   entirely if nothing else is running, and auto-continues (leaving the
+   other one running) when stdin isn't a terminal.
 1. Makes sure the shared Dozzle container is running
    (`infra/docker-compose.yml`, published at http://localhost:9999 — shows
    live logs for every container on the machine, grouped by compose project).
 2. Creates the project's shared docker network if it declared one.
-3. Prints one status table — service / runner / detail / url / status — and
+3. `--only a,b` / `--except a` narrow which services boot this time, without
+   touching the registered order or the other services' tracked state.
+4. Prints one status table — service / runner / detail / url / status — and
    keeps updating it in place as the boot progresses, rather than a wall of
    separate tables and headings. Each service's status cell moves through
-   `○ queued` → a spinning `starting (Ns)` → `● running` (its port answered),
-   `● started` (no port to check), or `✗ timeout` (its port never answered —
-   `run` moves on to the next service regardless). A dim line under the
-   table tracks which service is currently starting, and turns into the
-   `terminator window: ...` / `terminal windows: ...` pointer once
-   everything's up. If stdout isn't a terminal (piped/scripted), there's no
-   animation: the table prints once up front, plain `✓ x is up on :port`
-   lines print as each service finishes, then the table prints once more at
-   the end.
-4. Opens one window per service in registration order — a Terminator grid
+   `○ queued` → a spinning `starting (Ns)` → `● running (N.Ns)` (its port
+   answered, with how long it took), `● started` (no port to check),
+   `✗ exited (code)` (its own command died — caught in ~1-2s, not the full
+   port timeout), `✗ timeout` (its port never answered), or `✗ port busy`
+   (something else already had the port before this service was even
+   started — reported, never killed). `run` moves on to the next service
+   after any of these except a user-requested stop. A dim line under the
+   table tracks which service is currently starting — with an `s skip · q
+   abort` hint — and turns into the `terminator window: ...` / `terminal
+   windows: ...` pointer once everything's up (pressing `q` during a wait
+   stops the whole boot there instead). If stdout isn't a terminal (piped/
+   scripted), there's no animation: the table prints once up front, plain
+   `✓ x is up on :port (N.Ns)` lines print as each service finishes, then
+   the table prints once more at the end.
+5. Opens one window per service in registration order — a Terminator grid
    (at most 2 terminals per row) if it's installed, else one window per
    service in your default terminal emulator, else sequentially in the
    background with output logged to files under the system temp dir (the
@@ -162,12 +214,20 @@ project.
    - everything else: the service's actual run command, directly, in the foreground
    - if the service has a port, `run` polls it before moving on to the next one
 
+Once the boot finishes, a compact relative-duration bar prints under the
+table for every service that came up (needs at least two, to have something
+to be relative to) — a glance at which one was the slow one instead of
+reading back through the table's `● running <N.Ns>` cells.
+
 ## Where things live
 
 - **Code** (this repo): `~/tools/sspinner` (or wherever you clone it).
 - **Runtime state** (not in git): `~/.config/sspinner/registry.json` — the
   project → services config that every command reads/writes — and
   `~/.config/sspinner/running/<project>/` — one pid file per running
-  non-terminator-tracked service, so `stop` can find and kill it later.
+  non-terminator-tracked service (so `stop` can find and kill it later), plus
+  a `.rc` sibling written once that service's own command exits, which is
+  what lets `run` report a died-instantly service in ~1-2s instead of the
+  full port timeout.
 
 See `CLAUDE.md` for the internals if you're editing this tool with Claude Code.
