@@ -850,6 +850,28 @@ def compose_has_containers(compose_project):
     return bool(r.stdout.strip())
 
 
+def _stray_compose_projects(svc):
+    # INFO - M.E - 08/11/26 - A bare 'docker compose up' in the service's repo
+    # names the project after the directory, so its containers hold our ports
+    # while 'down -p <compose_project>' never sees them. Matched on the exact
+    # absolute working_dir label, never the basename, so unrelated repos that
+    # share a folder name can't be confused.
+    r = subprocess.run(
+        ["docker", "ps", "--format",
+         '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}'],
+        capture_output=True, text=True,
+    )
+    service_path = os.path.realpath(svc["path"])
+    strays = set()
+    for line in r.stdout.splitlines():
+        compose_project, _, working_dir = line.strip().partition("|")
+        if not compose_project or not working_dir or compose_project == svc["compose_project"]:
+            continue
+        if os.path.realpath(working_dir) == service_path:
+            strays.add(compose_project)
+    return sorted(strays)
+
+
 _running_compose_projects_cache = None
 
 
@@ -2049,6 +2071,25 @@ def teardown_project(name, entry):
     heading(f"Stopping '{name}'")
     services = entry["services"]
 
+    # INFO - M.E - 08/11/26 - Asked before any table is drawn: a prompt can't
+    # live inside a _Frame region. Never downed without a human saying yes.
+    strays_by_service = {}
+    for svc in services:
+        if svc["runner"] == "docker-compose":
+            strays = _stray_compose_projects(svc)
+            if strays:
+                strays_by_service[svc["name"]] = strays
+    strays_left = False
+    if strays_by_service:
+        for svc_name, strays in strays_by_service.items():
+            warn(f"{svc_name}: also running from the same directory as "
+                 f"compose project {', '.join(strays)}")
+        if not (_interactive() and ask_yes_no("bring those down too?", default=True)):
+            err("left running: " + ", ".join(
+                stray for strays in strays_by_service.values() for stray in strays))
+            strays_by_service = {}
+            strays_left = True
+
     if not sys.stdout.isatty():
         # Non-tty keeps the pre-dynamic behavior's shape: static table once,
         # subprocess output streaming straight through, plain ok()/err()
@@ -2061,21 +2102,25 @@ def teardown_project(name, entry):
             rows.append([svc["name"], svc["runner"], detail])
         print(render_table(["service", "runner", "detail"], rows))
 
-        clean = True
+        clean = not strays_left
         for svc in reversed(services):
             svc_name = svc["name"]
+            service_ok = True
             if svc["runner"] == "docker-compose":
-                project = svc["compose_project"]
+                compose_projects = [svc["compose_project"], *strays_by_service.get(svc_name, [])]
                 print(f"  stopping {paint(svc_name, C.BOLD)}...")
-                down_cmd = ["docker", "compose", "-p", project, "down",
-                            "--remove-orphans", "-t", DOWN_TIMEOUT_S]
-                subprocess.run(down_cmd)
-                if compose_has_containers(project):
-                    warn(f"{svc_name}: containers still up, retrying 'down'...")
+                for project in compose_projects:
+                    down_cmd = ["docker", "compose", "-p", project, "down",
+                                "--remove-orphans", "-t", DOWN_TIMEOUT_S]
                     subprocess.run(down_cmd)
-                if compose_has_containers(project):
-                    err(f"{svc_name}: containers still up after retry")
+                    if compose_has_containers(project):
+                        warn(f"{svc_name}: {project} containers still up, retrying 'down'...")
+                        subprocess.run(down_cmd)
+                still_up = [project for project in compose_projects if compose_has_containers(project)]
+                if still_up:
+                    err(f"{svc_name}: containers still up after retry ({', '.join(still_up)})")
                     clean = False
+                    service_ok = False
                 else:
                     # Best-effort: close the leftover pane shell (the
                     # `logs -f; exec bash` tail) now that the container it
@@ -2084,7 +2129,7 @@ def teardown_project(name, entry):
             else:
                 if kill_tracked_process(name, svc_name, svc["path"]):
                     ok(f"stopped {svc_name}")
-            if svc.get("port") and (svc["runner"] != "docker-compose" or clean):
+            if svc.get("port") and service_ok:
                 if wait_for_port_free(svc["port"]):
                     ok(f"port {svc['port']} for {svc_name} is free")
                 else:
@@ -2108,7 +2153,7 @@ def teardown_project(name, entry):
     table.draw()
     compose_failures = []  # (svc_name, captured compose output)
     port_failures = []  # (svc_name, port, holder_or_None)
-    clean = True
+    clean = not strays_left
 
     reversed_services = list(reversed(services))
     total = len(reversed_services)
@@ -2121,9 +2166,9 @@ def teardown_project(name, entry):
 
         service_ok = True
         if svc["runner"] == "docker-compose":
-            project = svc["compose_project"]
+            compose_projects = [svc["compose_project"], *strays_by_service.get(svc_name, [])]
 
-            def run_down_attempt():
+            def run_down_attempt(project):
                 proc = subprocess.Popen(
                     ["docker", "compose", "-p", project, "down",
                      "--remove-orphans", "-t", DOWN_TIMEOUT_S],
@@ -2138,10 +2183,12 @@ def teardown_project(name, entry):
                     time.sleep(0.25)
                 return proc.stdout.read() if proc.stdout else ""
 
-            output = run_down_attempt()
-            if compose_has_containers(project):
-                output += run_down_attempt()
-            if compose_has_containers(project):
+            output = ""
+            for project in compose_projects:
+                output += run_down_attempt(project)
+                if compose_has_containers(project):
+                    output += run_down_attempt(project)
+            if any(compose_has_containers(project) for project in compose_projects):
                 table.set_status(svc_name, ("✗ still up", C.RED), animate=True)
                 compose_failures.append((svc_name, output))
                 clean = False
@@ -2246,7 +2293,11 @@ def run_terminal_windows(name, entry, table, animate):
                 continue
             cmd = build_pane_command(svc, pidfile=_pidfile_path(name, svc["name"]))
             title = f"sspinner: {name} — {svc['name']}"
-            subprocess.Popen(_terminal_argv(binary_name, binary_path, title, cmd))
+            subprocess.Popen(
+                _terminal_argv(binary_name, binary_path, title, cmd),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+            )
             _poll_service_boot(name, svc, table, animate, i, total)
     except _BootAborted:
         table.set_context(dim(f"'{name}' boot aborted"), animate=animate)
@@ -2347,10 +2398,14 @@ def run_terminator(name, entry, table, animate):
         tf.write("\n".join(lines) + "\n")
         config_path = tf.name
 
-    subprocess.Popen([
-        "terminator", "-u", "-g", config_path, "-l", layout_name,
-        "-T", f"sspinner: {name}",
-    ])
+    # INFO - M.E - 08/11/26 - Detached from our stdio: an inherited pipe kept
+    # 'sspinner run ... | tee' hanging until the window closed.
+    subprocess.Popen(
+        ["terminator", "-u", "-g", config_path, "-l", layout_name,
+         "-T", f"sspinner: {name}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
 
     # Every pane's command already started the instant the window opened
     # above (the whole grid launches in one Popen call, unlike
@@ -2650,6 +2705,12 @@ def cmd_doctor(args):
 
             rows.append([svc["name"], path_cell, runner_cell, port_cell])
         print(render_table(["service", "path", "runner", "port"], rows))
+        for svc in entry["services"]:
+            if svc["runner"] != "docker-compose":
+                continue
+            for stray in _stray_compose_projects(svc):
+                warn(f"{svc['name']}: also running from {svc['path']} as compose project "
+                     f"'{stray}' (not '{svc['compose_project']}') - 'stop' will offer to bring it down")
 
 
 COMMANDS_HELP = [
