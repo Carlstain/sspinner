@@ -2293,7 +2293,11 @@ def run_terminal_windows(name, entry, table, animate):
                 continue
             cmd = build_pane_command(svc, pidfile=_pidfile_path(name, svc["name"]))
             title = f"sspinner: {name} — {svc['name']}"
-            subprocess.Popen(_terminal_argv(binary_name, binary_path, title, cmd))
+            subprocess.Popen(
+                _terminal_argv(binary_name, binary_path, title, cmd),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+            )
             _poll_service_boot(name, svc, table, animate, i, total)
     except _BootAborted:
         table.set_context(dim(f"'{name}' boot aborted"), animate=animate)
@@ -2394,10 +2398,14 @@ def run_terminator(name, entry, table, animate):
         tf.write("\n".join(lines) + "\n")
         config_path = tf.name
 
-    subprocess.Popen([
-        "terminator", "-u", "-g", config_path, "-l", layout_name,
-        "-T", f"sspinner: {name}",
-    ])
+    # INFO - M.E - 08/11/26 - Detached from our stdio: an inherited pipe kept
+    # 'sspinner run ... | tee' hanging until the window closed.
+    subprocess.Popen(
+        ["terminator", "-u", "-g", config_path, "-l", layout_name,
+         "-T", f"sspinner: {name}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
 
     # Every pane's command already started the instant the window opened
     # above (the whole grid launches in one Popen call, unlike
